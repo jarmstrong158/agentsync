@@ -170,6 +170,14 @@ def _remote_has_branch(cfg):
     return bool(p.stdout.strip())
 
 
+def _ref_exists(repo, ref):
+    """True if `ref` resolves to a commit in `repo`. Used to tell 'branch not
+    pushed yet' apart from a real merge conflict in check_conflicts."""
+    return _git(
+        ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], repo, check=False
+    ).returncode == 0
+
+
 def _default_remote_head(cfg):
     # origin/HEAD -> origin/main (or whatever the default is)
     p = _git(
@@ -608,6 +616,23 @@ def check_conflicts(against_branch: str = "") -> str:
         # resolve refs (prefer remote-tracking) and dry-run merge
         ref_mine = f"{remote}/{my_branch}"
         ref_their = f"{remote}/{br}"
+        # A missing ref (branch not pushed yet) makes merge-tree compare against
+        # nothing and return a misleading result. Report the real state instead of
+        # a phantom conflict — the claim_overlap above still tells you the intent.
+        if not _ref_exists(repo, ref_their):
+            merge = {"conflict": "branch_not_pushed",
+                     "note": f"partner branch '{br}' is not on '{remote}' yet — "
+                             "nothing to merge-test (claim_overlap still applies)"}
+            results.append({"partner": pid, "their_branch": br,
+                            "claim_overlap": overlap, "merge_conflict": merge})
+            continue
+        if not _ref_exists(repo, ref_mine):
+            merge = {"conflict": "branch_not_pushed",
+                     "note": f"your branch '{my_branch}' is not on '{remote}' yet — "
+                             "push it, then re-run check_conflicts"}
+            results.append({"partner": pid, "their_branch": br,
+                            "claim_overlap": overlap, "merge_conflict": merge})
+            continue
         mt = _git(
             ["merge-tree", "--write-tree", "--name-only", ref_mine, ref_their],
             repo,

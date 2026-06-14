@@ -231,6 +231,23 @@ def test_no_textual_conflict_when_disjoint():
         assert res["claim_overlap"] == [], res
 
 
+def test_check_conflicts_partner_branch_not_pushed():
+    """A partner who has claimed but not yet pushed their work branch must be
+    reported as 'branch_not_pushed', NOT a phantom conflict against a missing
+    remote ref (merge-tree vs a ref that doesn't exist)."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("auth", ["auth.py"], branch="jonny/auth")   # work branch never pushed
+        be(clones, "partner")
+        M.claim("ui", ["ui.py"], branch="partner/ui")       # never pushed either
+        be(clones, "jonny")
+        res = json.loads(M.check_conflicts())["results"][0]
+        assert res["merge_conflict"]["conflict"] == "branch_not_pushed", res
+        assert "partner/ui" in res["merge_conflict"]["note"], res
+        # claim_overlap still reports intent-level info even without a mergeable ref
+        assert res["claim_overlap"] == [], res
+
+
 # --------------------------------------------------------------------------- #
 # compare-and-swap (the core mutual-exclusion guarantee)
 # --------------------------------------------------------------------------- #
@@ -540,6 +557,7 @@ TESTS = [
     test_check_conflicts_requires_own_claim,
     test_textual_conflict_detected,
     test_no_textual_conflict_when_disjoint,
+    test_check_conflicts_partner_branch_not_pushed,
     test_cas_peer_entry_survives_retry,
     test_cas_colliding_peer_blocks_on_retry,
     test_gh_missing_friendly_error,
