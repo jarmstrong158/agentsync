@@ -51,6 +51,36 @@ mcp = FastMCP("agentsync")
 CLAIMS_FILE = "claims.json"
 PUSH_RETRIES = 5
 
+# Any single git/gh invocation is bounded so a stuck network call or an
+# un-answerable credential prompt fails fast instead of hanging the MCP server.
+GIT_TIMEOUT = int(os.environ.get("AGENTSYNC_GIT_TIMEOUT", "25"))
+
+
+def _noninteractive_env():
+    """git env that refuses to block on a credential/login prompt. In an MCP
+    subprocess there is no terminal or GUI to answer one, so a prompt would hang
+    forever; these force git to error out immediately instead."""
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"     # never prompt on the terminal
+    env["GCM_INTERACTIVE"] = "Never"     # Git Credential Manager: no popup dialog
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
+
+
+def _log(msg):
+    """Append a timestamped line to <repo>/.git/agentsync.log. Best-effort: a
+    logging failure must never break a tool call. This is the breadcrumb trail
+    that turns 'it hangs' into 'it hung on exactly this git command'."""
+    try:
+        repo = os.environ.get("AGENTSYNC_REPO")
+        if not repo:
+            return
+        line = f"{datetime.now(timezone.utc).isoformat()} {msg}\n"
+        with open(os.path.join(repo, ".git", "agentsync.log"), "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
 
 # --------------------------------------------------------------------------- #
 # config
@@ -86,9 +116,24 @@ def _cfg(require_git=True):
 # git helpers
 # --------------------------------------------------------------------------- #
 def _git(args, cwd, check=True):
-    p = subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True
-    )
+    t0 = time.time()
+    try:
+        p = subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True,
+            env=_noninteractive_env(), timeout=GIT_TIMEOUT,
+            stdin=subprocess.DEVNULL,   # CRITICAL: never inherit the MCP stdio pipe.
+            # Without this, git inherits the server's stdin (the JSON-RPC transport)
+            # and any credential prompt blocks forever reading from it.
+        )
+    except subprocess.TimeoutExpired:
+        _log(f"TIMEOUT after {GIT_TIMEOUT}s: git {' '.join(args)} (cwd={cwd})")
+        raise RuntimeError(
+            f"git {' '.join(args)} timed out after {GIT_TIMEOUT}s — likely a "
+            "stuck network call or a credential prompt git couldn't answer. "
+            "Verify `git fetch` and `git push` work from this clone "
+            "(e.g. `gh auth setup-git`)."
+        )
+    _log(f"{time.time() - t0:5.2f}s rc={p.returncode}: git {' '.join(args)}")
     if check and p.returncode != 0:
         raise RuntimeError(
             f"git {' '.join(args)} failed ({p.returncode}): {p.stderr.strip()}"
@@ -101,12 +146,17 @@ def _gh(args, cwd=None, check=True):
     command fails."""
     try:
         p = subprocess.run(
-            ["gh", *args], cwd=cwd, capture_output=True, text=True
+            ["gh", *args], cwd=cwd, capture_output=True, text=True,
+            timeout=GIT_TIMEOUT, stdin=subprocess.DEVNULL,   # never inherit the MCP stdio pipe
         )
     except FileNotFoundError:
         raise RuntimeError(
             "The GitHub CLI ('gh') is not installed or not on PATH. Install it "
             "from https://cli.github.com and run `gh auth login`, then retry."
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"gh {' '.join(args)} timed out after {GIT_TIMEOUT}s."
         )
     if check and p.returncode != 0:
         raise RuntimeError(
