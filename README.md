@@ -131,8 +131,17 @@ The full prompt your agent should run is in **AGENTS.md**.
 ## Test
 
 ```bash
-python3 test_agentsync.py     # spins up a real origin + two clones, drives the protocol
+python3 test_agentsync.py     # spins up real git repos and drives every path
 ```
+
+The suite (17 cases, isolated per test) covers the protocol (claim/block on
+shared files and dependency-on-WIP, force override, done-claims-don't-block,
+status validation), conflict detection (textual conflict and clean-merge),
+the **compare-and-swap guarantee** (a peer claim landing mid-flight both
+survives our retry and is observed in time to block a collision), error paths,
+and provisioning (create + seed + invite, partner-from-env, existing-remote
+skip, invite-failure reporting) with the `gh` CLI stubbed so no real GitHub repo
+is touched. CI runs it on every push via [GitHub Actions](.github/workflows/test.yml).
 
 ## Limitations
 
@@ -146,7 +155,8 @@ python3 test_agentsync.py     # spins up a real origin + two clones, drives the 
 - **Advisory locks.** Claims prevent collisions by convention, not enforcement;
   `force=True` exists precisely because some overlaps are fine.
 
-## No license file included
+## License
 
-Licensing is your call — drop in whatever terms you want (your other projects
-use PolyForm Noncommercial). Nothing here assumes one.
+[PolyForm Noncommercial License 1.0.0](LICENSE.md) — free to use, modify, and
+share for any **noncommercial** purpose. Commercial use requires a separate
+license.
