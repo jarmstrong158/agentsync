@@ -468,6 +468,64 @@ def test_provision_reports_invite_failure():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_add_collaborator():
+    root = tempfile.mkdtemp(prefix="agentsync_collab_")
+    try:
+        repo = os.path.join(root, "proj")
+        os.makedirs(repo)
+        git(["init", "-q", "-b", "main"], repo)  # _cfg() needs a .git dir
+        invites = []
+
+        def fake_gh(args, cwd=None, check=True):
+            if args[:2] == ["repo", "view"]:
+                return SimpleNamespace(returncode=0, stdout="tester/proj\n",
+                                       stderr="")
+            if args[:3] == ["api", "-X", "PUT"]:
+                invites.append(args[3].rsplit("/", 1)[-1])  # username
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected gh call: {args}")
+
+        M._gh = fake_gh
+        os.environ["AGENTSYNC_REPO"] = repo
+        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+
+        r = json.loads(M.add_collaborator("jarmstrong158"))
+        assert r["status"] == "invited", r
+        assert r["repo"] == "tester/proj", r
+        assert r["permission"] == "push", r
+        assert "jarmstrong158" in invites, invites
+        assert r["clone_url"] == "https://github.com/tester/proj.git", r
+
+        # invalid permission is rejected before any gh call
+        r2 = json.loads(M.add_collaborator("x", permission="superuser"))
+        assert "error" in r2, r2
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_add_collaborator_no_remote():
+    root = tempfile.mkdtemp(prefix="agentsync_collab_")
+    try:
+        repo = os.path.join(root, "proj")
+        os.makedirs(repo)
+        git(["init", "-q", "-b", "main"], repo)
+
+        def fake_gh(args, cwd=None, check=True):
+            if args[:2] == ["repo", "view"]:  # no GitHub repo behind origin
+                return SimpleNamespace(returncode=1, stdout="", stderr="no repo")
+            raise AssertionError(f"unexpected gh call: {args}")
+
+        M._gh = fake_gh
+        os.environ["AGENTSYNC_REPO"] = repo
+        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+
+        r = json.loads(M.add_collaborator("jarmstrong158"))
+        assert "error" in r, r
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------- #
 # runner
 # --------------------------------------------------------------------------- #
@@ -489,6 +547,8 @@ TESTS = [
     test_provision_partner_from_env,
     test_provision_skips_when_remote_already_configured,
     test_provision_reports_invite_failure,
+    test_add_collaborator,
+    test_add_collaborator_no_remote,
 ]
 
 

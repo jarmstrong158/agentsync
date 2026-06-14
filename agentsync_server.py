@@ -248,6 +248,73 @@ def _ensure_git_identity(repo):
     _git(["config", "user.email", f"{login}@users.noreply.github.com"], repo)
 
 
+VALID_PERMISSIONS = ("pull", "triage", "push", "maintain", "admin")
+
+
+def _invite_collaborator(slug, user, permission="push"):
+    """Invite `user` to `slug` at the given permission. Returns (ok, message)."""
+    r = _gh(
+        ["api", "-X", "PUT", f"repos/{slug}/collaborators/{user}",
+         "-f", f"permission={permission}"],
+        check=False,
+    )
+    if r.returncode == 0:
+        return True, f"invited {user} ({permission})"
+    return False, f"could not invite {user}: {r.stderr.strip()[:200]}"
+
+
+def _repo_slug(repo_path):
+    """Resolve the 'owner/name' of the GitHub repo behind this clone's origin."""
+    p = _gh(
+        ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+        cwd=repo_path, check=False,
+    )
+    return p.stdout.strip()
+
+
+@mcp.tool()
+def add_collaborator(github_username: str, permission: str = "push") -> str:
+    """Invite someone as a collaborator on the shared repo so they can push to
+    it. Use this when the repo already exists and you just want to grant a
+    partner access (provision() does this too, but only as part of first-time
+    setup).
+
+    github_username : the GitHub user to invite (e.g. "jarmstrong158").
+    permission      : pull | triage | push | maintain | admin  (default push).
+
+    The invited user must accept the GitHub invitation before they can push.
+    Requires the `gh` CLI authenticated with admin on the repo. Returns the
+    clone URL to hand the new collaborator."""
+    if permission not in VALID_PERMISSIONS:
+        return json.dumps(
+            {"error": f"permission must be one of {', '.join(VALID_PERMISSIONS)}"}
+        )
+    cfg = _cfg()
+    slug = _repo_slug(cfg["repo"])
+    if not slug:
+        return json.dumps(
+            {"error": "Could not determine the GitHub repo from this clone's "
+             "'origin' remote. Is it a GitHub repo with a remote set?"}
+        )
+    ok, msg = _invite_collaborator(slug, github_username, permission)
+    return json.dumps(
+        {
+            "status": "invited" if ok else "failed",
+            "repo": slug,
+            "collaborator": github_username,
+            "permission": permission,
+            "message": msg,
+            "clone_url": f"https://github.com/{slug}.git",
+            "next": (
+                f"Tell {github_username} to accept the invite (GitHub email/"
+                f"notification), then `git clone https://github.com/{slug}.git` "
+                "and point their agentsync server at that clone."
+            ) if ok else None,
+        },
+        indent=2,
+    )
+
+
 @mcp.tool()
 def provision(
     repo: str = "",
@@ -336,17 +403,9 @@ def provision(
     steps.append(f"seeded coordination branch '{seed_cfg['branch']}'")
 
     # 5. invite the partner
-    invite = None
+    invited_ok = False
     if partner:
-        r = _gh(
-            ["api", "-X", "PUT", f"repos/{slug}/collaborators/{partner}",
-             "-f", "permission=push"],
-            check=False,
-        )
-        if r.returncode == 0:
-            invite = f"invited {partner} as a collaborator"
-        else:
-            invite = f"could not invite {partner}: {r.stderr.strip()[:200]}"
+        invited_ok, invite = _invite_collaborator(slug, partner)
         steps.append(invite)
 
     clone_url = f"https://github.com/{slug}.git"
@@ -358,7 +417,7 @@ def provision(
             "default_branch": default_branch,
             "coordination_branch": seed_cfg["branch"],
             "steps": steps,
-            "partner_invited": bool(partner) and invite and invite.startswith("invited"),
+            "partner_invited": invited_ok,
             "next": (
                 f"Send your partner: `git clone {clone_url}` (they accept the "
                 "GitHub invite first), then both add the agentsync MCP server "

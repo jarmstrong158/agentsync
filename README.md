@@ -90,6 +90,12 @@ repo via `gh`, makes the first commit, seeds the `agentsync` branch, and invites
 the partner as a push collaborator. Idempotent. Returns the `clone_url` to hand
 your partner. (Needs the `gh` CLI authenticated with `repo` scope.)
 
+**`add_collaborator(github_username, permission="push")`** — invite someone to
+the **existing** shared repo so they can push (`pull`|`triage`|`push`|`maintain`
+|`admin`). Use this when the repo already exists and you just want to grant a
+partner access. They must accept the GitHub invite, then clone. Returns the
+clone URL to hand them. (Needs `gh` with admin on the repo.)
+
 **`survey()`** — pull the latest state and report what every *other* agent has
 claimed: task, files, dependencies, branch, status, timestamp. Run it before
 planning and again after finishing.
@@ -134,14 +140,15 @@ The full prompt your agent should run is in **AGENTS.md**.
 python3 test_agentsync.py     # spins up real git repos and drives every path
 ```
 
-The suite (17 cases, isolated per test) covers the protocol (claim/block on
+The suite (19 cases, isolated per test) covers the protocol (claim/block on
 shared files and dependency-on-WIP, force override, done-claims-don't-block,
 status validation), conflict detection (textual conflict and clean-merge),
 the **compare-and-swap guarantee** (a peer claim landing mid-flight both
 survives our retry and is observed in time to block a collision), error paths,
-and provisioning (create + seed + invite, partner-from-env, existing-remote
-skip, invite-failure reporting) with the `gh` CLI stubbed so no real GitHub repo
-is touched. CI runs it on every push via [GitHub Actions](.github/workflows/test.yml).
+provisioning (create + seed + invite, partner-from-env, existing-remote skip,
+invite-failure reporting), and `add_collaborator` (invite + bad-permission +
+no-remote) with the `gh` CLI stubbed so no real GitHub repo is touched. CI runs
+it on every push via [GitHub Actions](.github/workflows/test.yml).
 
 ## Limitations
 
