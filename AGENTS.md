@@ -57,13 +57,16 @@ whatever git tooling it already has for clone/branch/commit/push).
 >   breakage the merge won't show — e.g. they changed a function signature,
 >   constant, schema, or interface you consume. If your code needs to adapt,
 >   update it. The merge passing is necessary, not sufficient.
-> Then `update_status("done", note="<what you changed / reconciled>")`.
+> Then `update_status("done", note="<what you changed / reconciled>")`, or
+> `finish(note=...)` to mark done AND open a PR in one step. Either way the
+> claim is auto-annotated with `changed_files` (your branch's diffstat) so the
+> partner reconciles against real data, not just your note. To see what a
+> partner has been doing over time, `history()`.
 >
 > **5b. Partner is still `in-progress`.**
-> Don't block on them. Push your branch, then
-> `update_status("done", note="<summary of what you built and any interface the
-> partner should know about>")`. The note is how they'll reconcile against your
-> work when they finish.
+> Don't block on them. Push your branch, then `update_status("done", note=...)`
+> (or `finish(...)` to open a PR). The note is how they'll reconcile against
+> your work when they finish; `changed_files` is captured automatically.
 >
 > **Rules.**
 > - Query, never assume: a fresh `survey()` beats memory of an earlier one.

@@ -691,6 +691,108 @@ def test_provision_invites_multiple_partners():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def _push_branch_with_change(clone, branch, fname, content):
+    """Create `branch` off the current HEAD, add a file, and push it."""
+    git(["checkout", "-qb", branch], clone)
+    with open(os.path.join(clone, fname), "w") as f:
+        f.write(content)
+    git(["add", fname], clone)
+    git(["commit", "-qm", f"add {fname}"], clone)
+    git(["push", "-q", "origin", branch], clone)
+    git(["checkout", "-q", "main"], clone)
+
+
+# --------------------------------------------------------------------------- #
+# history / done-diffstat / finish
+# --------------------------------------------------------------------------- #
+def test_history_timeline():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("auth", ["auth.py"], branch="jonny/auth")
+        M.update_status("done")
+        h = json.loads(M.history())
+        subjects = [e["event"] for e in h["events"]]
+        assert any("claims 'auth'" in s for s in subjects), h
+        assert "-> done" in h["events"][0]["event"], h  # newest first
+        assert h["events"][0]["by"], h  # author recorded
+
+
+def test_done_captures_changed_files():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("auth", ["auth.py"], branch="jonny/auth")
+        _push_branch_with_change(clones["jonny"], "jonny/auth", "auth.py", "x=1\n")
+        be(clones, "jonny")
+        r = json.loads(M.update_status("done"))
+        cf = r["claim"]["changed_files"]
+        assert cf and any(c["path"] == "auth.py" for c in cf), r
+        assert cf[0]["status"] == "A", r  # added file
+
+
+def test_finish_opens_pr_and_marks_done():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("auth", ["auth.py"], branch="jonny/auth")
+        _push_branch_with_change(clones["jonny"], "jonny/auth", "auth.py", "x=1\n")
+
+        orig = M._gh
+
+        def fake_gh(args, cwd=None, check=True):
+            if args[:2] == ["pr", "create"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="https://github.com/o/r/pull/7\n", stderr="")
+            raise AssertionError(f"unexpected gh call: {args}")
+
+        M._gh = fake_gh
+        try:
+            be(clones, "jonny")
+            r = json.loads(M.finish(note="please review"))
+        finally:
+            M._gh = orig
+        assert r["status"] == "finished", r
+        assert r["pr_url"].endswith("/pull/7"), r
+        assert r["claim"]["status"] == "done", r
+        assert r["claim"]["changed_files"], r
+
+
+def test_finish_returns_existing_pr_url():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("auth", ["auth.py"], branch="jonny/auth")
+        _push_branch_with_change(clones["jonny"], "jonny/auth", "auth.py", "x=1\n")
+
+        orig = M._gh
+
+        def fake_gh(args, cwd=None, check=True):
+            if args[:2] == ["pr", "create"]:
+                return SimpleNamespace(returncode=1, stdout="",
+                                       stderr="a pull request already exists")
+            if args[:2] == ["pr", "view"]:
+                return SimpleNamespace(returncode=0,
+                                       stdout="https://github.com/o/r/pull/3\n",
+                                       stderr="")
+            raise AssertionError(f"unexpected gh call: {args}")
+
+        M._gh = fake_gh
+        try:
+            be(clones, "jonny")
+            r = json.loads(M.finish())
+        finally:
+            M._gh = orig
+        assert r["status"] == "finished", r
+        assert r["pr_url"].endswith("/pull/3"), r
+
+
+def test_finish_requires_pushed_branch():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("auth", ["auth.py"], branch="jonny/auth")  # never pushed
+        be(clones, "jonny")
+        r = json.loads(M.finish())
+        assert "error" in r and "push" in r["error"].lower(), r
+
+
 # --------------------------------------------------------------------------- #
 # runner
 # --------------------------------------------------------------------------- #
@@ -724,6 +826,11 @@ TESTS = [
     test_duplicate_agent_id_warns,
     test_add_multiple_collaborators,
     test_provision_invites_multiple_partners,
+    test_history_timeline,
+    test_done_captures_changed_files,
+    test_finish_opens_pr_and_marks_done,
+    test_finish_returns_existing_pr_url,
+    test_finish_requires_pushed_branch,
 ]
 
 

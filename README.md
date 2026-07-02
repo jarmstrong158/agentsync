@@ -132,8 +132,20 @@ to check one specific branch.
 
 **`update_status(status, note="")`** — set your own claim's status
 (`planning` | `in-progress` | `done`) and optionally leave a note for your
-partner. Pushes immediately. (To drop a claim without finishing it, use
-`release()`.)
+partner. Pushes immediately. On `done`, the claim is auto-annotated with
+`changed_files` — your branch's diffstat vs the default branch — so your partner
+reconciles against real data, not just a hand-written summary. (To drop a claim
+without finishing it, use `release()`.)
+
+**`finish(note="", title="", draft=False)`** — close the loop: mark your claim
+`done` **and** open a GitHub pull request from your claimed branch into the
+default branch. Falls back to your claim's task/note for the PR title/body, and
+returns the existing PR's URL if one is already open. Your branch must be pushed.
+(Needs `gh`.)
+
+**`history(limit=20)`** — the coordination timeline (who claimed, finished, or
+released what, and when) read from the git history of `claims.json`, newest
+first. Answers "what has my partner been up to?" even when they're offline.
 
 ## The workflow (what your agent does)
 
@@ -144,7 +156,8 @@ partner. Pushes immediately. (To drop a claim without finishing it, use
 4. build on your branch
 5. `survey()` again — where are they now?
 6. `check_conflicts()` — does their landed work collide with mine?
-7. reconcile (rebase/merge or flag) → `update_status("done", note=...)`
+7. reconcile (rebase/merge or flag) → `update_status("done", ...)` or
+   `finish(...)` to also open a PR
 
 The full prompt your agent should run is in **AGENTS.md**.
 
@@ -170,18 +183,20 @@ python3 test_agentsync.py     # unit + protocol suite (real git repos)
 python3 test_workflow.py      # two-person lifecycle + real MCP stdio transport
 ```
 
-`test_agentsync.py` (29 cases, isolated per test) covers the protocol (claim/
+`test_agentsync.py` (34 cases, isolated per test) covers the protocol (claim/
 block on shared files and dependency-on-WIP, force override, done-claims-don't-
 block, status validation), **path-aware overlap** (directory containment, globs,
 normalization, disjoint-dirs-are-clean), conflict detection (textual conflict and
 clean-merge), the **compare-and-swap guarantee** (a peer claim landing mid-flight
 both survives our retry and is observed in time to block a collision), liveness
-(`release`, `stale` flagging, the duplicate-id warning), error paths, and
-provisioning + `add_collaborator` (single and multi-invite, partner-from-env,
-existing-remote skip, invite-failure reporting, bad-permission, no-remote) with
-the `gh` CLI stubbed so no real GitHub repo is touched. `test_workflow.py` (5
-cases) drives the full two-person lifecycle and the real MCP stdio transport as a
-subprocess. CI runs both on every push via [GitHub Actions](.github/workflows/test.yml).
+(`release`, `stale` flagging, the duplicate-id warning), the review loop
+(`history` timeline, `done` diffstat capture, `finish` opening/reusing a PR,
+push-required guard), error paths, and provisioning + `add_collaborator` (single
+and multi-invite, partner-from-env, existing-remote skip, invite-failure
+reporting, bad-permission, no-remote) with the `gh` CLI stubbed so no real GitHub
+repo is touched. `test_workflow.py` (5 cases) drives the full two-person
+lifecycle and the real MCP stdio transport as a subprocess. CI runs both on every
+push via [GitHub Actions](.github/workflows/test.yml).
 
 ## Limitations
 

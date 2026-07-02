@@ -201,6 +201,30 @@ def _default_remote_head(cfg):
     return f"{cfg['remote']}/main"
 
 
+def _branch_changes(cfg, branch):
+    """The files a claimed branch changed vs the default branch (three-dot, so
+    only this branch's own work). Returns a list of {status, path}, or None if
+    the branch isn't pushed yet / can't be diffed. Used to auto-fill a 'done'
+    claim with real data instead of a hand-written summary."""
+    repo, remote = cfg["repo"], cfg["remote"]
+    _git(["fetch", remote, "--prune"], repo, check=False)
+    tip = f"{remote}/{branch}"
+    if not _ref_exists(repo, tip):
+        return None
+    base = _default_remote_head(cfg)
+    p = _git(["diff", "--name-status", f"{base}...{tip}"], repo, check=False)
+    if p.returncode != 0:
+        return None
+    changes = []
+    for line in p.stdout.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        changes.append({"status": parts[0], "path": parts[-1]})
+    return changes
+
+
 def _ensure_worktree(cfg):
     """Guarantee a worktree at cfg['worktree'] checked out to the coordination
     branch, synced to the remote tip. Creates the branch on first use."""
@@ -835,33 +859,145 @@ def release(note: str = "") -> str:
     return json.dumps({"status": "retry_exhausted"})
 
 
-@mcp.tool()
-def update_status(status: str, note: str = "") -> str:
-    """Update your own claim's status (e.g. 'in-progress' -> 'done') and
-    optionally attach a note for your partner. Pushes immediately.
-    To drop a claim without finishing it, use release() instead."""
-    if status not in {"planning", "in-progress", "done"}:
-        return json.dumps(
-            {"error": "status must be planning | in-progress | done"}
-        )
-    cfg = _cfg()
+def _set_status(cfg, status, note):
+    """CAS-update this agent's claim status. On 'done', auto-capture the claimed
+    branch's diffstat into `changed_files` so a partner reconciling has real data,
+    not just a hand-written note. Returns (ok, result) where result is the claim
+    dict on success or an error/status string on failure."""
+    done_changes = None
+    computed = False
     for attempt in range(PUSH_RETRIES):
         _ensure_worktree(cfg)
         data = _read_claims(cfg)
         mine = data["claims"].get(cfg["agent"])
         if not mine:
-            return json.dumps({"error": "No claim to update. Call claim() first."})
+            return False, "No claim to update. Call claim() first."
         mine["status"] = status
         mine["updated_at"] = _now()
         mine["instance"] = INSTANCE
         if note:
             mine["note"] = note
+        if status == "done" and mine.get("branch"):
+            if not computed:  # branch is stable across retries; compute once
+                done_changes = _branch_changes(cfg, mine["branch"])
+                computed = True
+            mine["changed_files"] = done_changes
         with open(os.path.join(cfg["worktree"], CLAIMS_FILE), "w") as f:
             json.dump(data, f, indent=2)
         if _commit_and_push(cfg, f"agentsync: {cfg['agent']} -> {status}"):
-            return json.dumps({"status": "updated", "claim": mine}, indent=2)
+            return True, mine
         time.sleep(0.4 * (attempt + 1))
-    return json.dumps({"status": "retry_exhausted"})
+    return False, "retry_exhausted"
+
+
+@mcp.tool()
+def update_status(status: str, note: str = "") -> str:
+    """Update your own claim's status (e.g. 'in-progress' -> 'done') and
+    optionally attach a note for your partner. Pushes immediately. On 'done' the
+    claim is auto-annotated with `changed_files` (your branch's diffstat vs the
+    default branch). To drop a claim without finishing it, use release(); to
+    finish AND open a PR, use finish()."""
+    if status not in {"planning", "in-progress", "done"}:
+        return json.dumps(
+            {"error": "status must be planning | in-progress | done"}
+        )
+    cfg = _cfg()
+    ok, res = _set_status(cfg, status, note)
+    if not ok:
+        if res == "retry_exhausted":
+            return json.dumps({"status": "retry_exhausted"})
+        return json.dumps({"error": res})
+    return json.dumps({"status": "updated", "claim": res}, indent=2)
+
+
+@mcp.tool()
+def finish(note: str = "", title: str = "", draft: bool = False) -> str:
+    """Close the loop: mark your claim done AND open a GitHub pull request from
+    your claimed branch into the default branch, so your work lands in review.
+
+    note   : PR body (falls back to your claim's existing note).
+    title  : PR title (falls back to your claim's task).
+    draft  : open the PR as a draft.
+
+    Your branch must already be pushed. If a PR for the branch already exists,
+    its URL is returned instead of erroring. Requires the `gh` CLI. The claim is
+    marked done (with auto-captured `changed_files`) after the PR is opened."""
+    cfg = _cfg()
+    _ensure_worktree(cfg)
+    mine = _read_claims(cfg)["claims"].get(cfg["agent"])
+    if not mine or not mine.get("branch"):
+        return json.dumps(
+            {"error": "No branch on your claim. Call claim(...) first."}
+        )
+    branch = mine["branch"]
+    repo, remote = cfg["repo"], cfg["remote"]
+    _git(["fetch", remote, "--prune"], repo, check=False)
+    if not _ref_exists(repo, f"{remote}/{branch}"):
+        return json.dumps(
+            {"error": f"Branch '{branch}' isn't on '{remote}' yet — push it, "
+             "then call finish()."}
+        )
+
+    base = _default_remote_head(cfg).rsplit("/", 1)[-1]  # 'origin/main' -> 'main'
+    pr_title = title or mine.get("task") or branch
+    pr_body = note or mine.get("note") or ""
+    args = ["pr", "create", "--head", branch, "--base", base,
+            "--title", pr_title, "--body", pr_body]
+    if draft:
+        args.append("--draft")
+    created = _gh(args, cwd=repo, check=False)
+    if created.returncode == 0:
+        pr_url = created.stdout.strip().splitlines()[-1] if created.stdout.strip() else ""
+    else:
+        # most common non-zero: a PR for this branch already exists
+        view = _gh(["pr", "view", branch, "--json", "url", "--jq", ".url"],
+                   cwd=repo, check=False)
+        if view.returncode == 0 and view.stdout.strip():
+            pr_url = view.stdout.strip()
+        else:
+            return json.dumps(
+                {"status": "pr_failed",
+                 "detail": created.stderr.strip()[:300],
+                 "hint": "Open the PR manually; your claim was NOT marked done."}
+            )
+
+    ok, res = _set_status(cfg, "done", note)
+    return json.dumps(
+        {
+            "status": "finished" if ok else "pr_opened_status_failed",
+            "pr_url": pr_url,
+            "branch": branch,
+            "claim": res if ok else None,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def history(limit: int = 20) -> str:
+    """The coordination timeline: who claimed, finished, or released what, and
+    when — read from the git history of claims.json. Newest first. `limit` caps
+    how many events are returned. Useful for 'what has my partner been doing?'
+    without needing them online."""
+    cfg = _cfg()
+    _ensure_worktree(cfg)
+    limit = max(1, min(int(limit), 200))
+    p = _git(
+        ["log", f"-{limit}", "--format=%H%x1f%aI%x1f%an%x1f%s", "--", CLAIMS_FILE],
+        cfg["worktree"], check=False,
+    )
+    events = []
+    for line in p.stdout.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) == 4:
+            h, when, who, subject = parts
+            events.append(
+                {"commit": h[:10], "at": when, "by": who, "event": subject}
+            )
+    return json.dumps(
+        {"branch": cfg["branch"], "count": len(events), "events": events},
+        indent=2,
+    )
 
 
 if __name__ == "__main__":
