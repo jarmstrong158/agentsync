@@ -70,6 +70,13 @@ whatever git tooling it already has for clone/branch/commit/push).
 > - One unit of work = one claim. Re-claim for the next unit.
 > - A blocked claim is information, not failure — it tells you exactly what to
 >   route around.
+> - If you abandon a task instead of finishing it, call `release()` so you don't
+>   leave the files locked behind you.
+> - Watch `survey()`'s `stale_claims`: if a partner has sat on files well past
+>   `AGENTSYNC_STALE_HOURS`, they may have crashed — check in before you assume
+>   the lock is live.
+> - Every collaborator needs a **unique** `AGENTSYNC_AGENT_ID`. If `claim()`
+>   returns a `warning` about a shared id, stop and fix the ids before continuing.
 > - You only see a partner's *intent* if their agent also runs agentsync. If a
 >   partner has no claim but you see active branches, treat those branches as
 >   landed work and rely on `check_conflicts` at merge time.

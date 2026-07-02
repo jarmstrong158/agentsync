@@ -61,7 +61,8 @@ agent id and their own local clone. See `mcp.config.example.json`:
 | `AGENTSYNC_AGENT_ID`      | yes      | —           | your unique agent id                       |
 | `AGENTSYNC_REMOTE`        | no       | `origin`    | git remote name                            |
 | `AGENTSYNC_BRANCH`        | no       | `agentsync` | coordination branch name                   |
-| `AGENTSYNC_PARTNER_GITHUB`| no       | —           | partner's GitHub user, invited by `provision()` |
+| `AGENTSYNC_PARTNER_GITHUB`| no       | —           | partner GitHub user(s) to invite (comma/space-separated) |
+| `AGENTSYNC_STALE_HOURS`   | no       | `24`        | age after which an in-progress claim is flagged `stale` |
 
 The `agentsync` branch is created automatically on the first `survey()` or
 `claim()` call — no manual setup.
@@ -90,27 +91,39 @@ repo via `gh`, makes the first commit, seeds the `agentsync` branch, and invites
 the partner as a push collaborator. Idempotent. Returns the `clone_url` to hand
 your partner. (Needs the `gh` CLI authenticated with `repo` scope.)
 
-**`add_collaborator(github_username, permission="push")`** — invite someone to
-the **existing** shared repo so they can push (`pull`|`triage`|`push`|`maintain`
-|`admin`). Use this when the repo already exists and you just want to grant a
-partner access. They must accept the GitHub invite, then clone. Returns the
-clone URL to hand them. (Needs `gh` with admin on the repo.)
+**`add_collaborator(github_username, permission="push")`** — invite **one or
+more** people (comma/space-separated) to the **existing** shared repo so they can
+push (`pull`|`triage`|`push`|`maintain`|`admin`). Use this when the repo already
+exists and you just want to grant access — this is how you build a team of more
+than two. They must accept the GitHub invite, then clone. (Needs `gh` with admin
+on the repo.)
 
 **`survey()`** — pull the latest state and report what every *other* agent has
-claimed: task, files, dependencies, branch, status, timestamp. Run it before
-planning and again after finishing.
+claimed: task, files, dependencies, branch, status, timestamp. Works for any
+number of collaborators. Each partner entry is annotated with `age_hours` and a
+`stale` flag (in-progress and older than `AGENTSYNC_STALE_HOURS`, default 24h),
+and a top-level `stale_claims` list — so you can spot a partner who crashed or
+walked away still holding files. Run it before planning and after finishing.
 
 **`claim(task, touches, requires=None, branch="", force=False)`** — stake a
 unit of work. Refuses with `status: "blocked"` if your `touches` hits a
 partner's active files (you'd get in their way) or your `requires` hits their
 in-progress files (you'd build on unstable ground), returning exactly what
-overlaps and with whom. The overlap is checked against freshly-fetched state
-immediately before the push. Pass `force=True` to claim anyway (e.g. same large
-file, disjoint regions).
+overlaps and with whom. **Overlap is path-aware**: exact match, directory
+containment (`src/api` vs `src/api/routes.py`), and globs (`src/**`, `*.py`) all
+collide, and paths are normalized first (`./auth.py` == `auth.py`). The overlap
+is checked against freshly-fetched state immediately before the push. Pass
+`force=True` to claim anyway (e.g. same large file, disjoint regions). If two
+people share an agent id, the result carries a `warning`.
+
+**`release(note="")`** — abandon your current claim **without** marking it done,
+freeing the files for a partner to take over. Use it when you drop a task or step
+away — otherwise a crashed/abandoned claim blocks those files until someone does
+manual git surgery. Pushes immediately.
 
 **`check_conflicts(against_branch="")`** — after building, diff your branch
 against your partners' branches at two levels:
-- `claim_overlap` — declared-file intersection (intent).
+- `claim_overlap` — declared-path intersection (intent, path-aware).
 - `merge_conflict` — a real `git merge-tree` dry-run merge (textual). Catches
   collisions the claims didn't predict.
 
@@ -119,7 +132,8 @@ to check one specific branch.
 
 **`update_status(status, note="")`** — set your own claim's status
 (`planning` | `in-progress` | `done`) and optionally leave a note for your
-partner. Pushes immediately.
+partner. Pushes immediately. (To drop a claim without finishing it, use
+`release()`.)
 
 ## The workflow (what your agent does)
 
@@ -134,21 +148,40 @@ partner. Pushes immediately.
 
 The full prompt your agent should run is in **AGENTS.md**.
 
+## More than two agents
+
+Nothing here is limited to two. `claims.json` is keyed by agent id, `claim()`
+checks your plan against *every* peer, and the compare-and-swap only ever edits
+your own key — so three, four, or more agents coordinate safely. To run a team:
+
+- Invite everyone: `add_collaborator("alice, bob, carol")` (or list them in
+  `provision(partner_github=...)`).
+- **Give every person a unique `AGENTSYNC_AGENT_ID`.** Two people sharing an id
+  overwrite each other's claim; `claim()` returns a `warning` when it detects
+  this, but a unique id per person avoids it entirely.
+- Contention stays cheap for a handful of agents; with *many* simultaneous
+  claimers a `claim()` can return `retry_exhausted` — just call `survey()` and
+  retry.
+
 ## Test
 
 ```bash
-python3 test_agentsync.py     # spins up real git repos and drives every path
+python3 test_agentsync.py     # unit + protocol suite (real git repos)
+python3 test_workflow.py      # two-person lifecycle + real MCP stdio transport
 ```
 
-The suite (19 cases, isolated per test) covers the protocol (claim/block on
-shared files and dependency-on-WIP, force override, done-claims-don't-block,
-status validation), conflict detection (textual conflict and clean-merge),
-the **compare-and-swap guarantee** (a peer claim landing mid-flight both
-survives our retry and is observed in time to block a collision), error paths,
-provisioning (create + seed + invite, partner-from-env, existing-remote skip,
-invite-failure reporting), and `add_collaborator` (invite + bad-permission +
-no-remote) with the `gh` CLI stubbed so no real GitHub repo is touched. CI runs
-it on every push via [GitHub Actions](.github/workflows/test.yml).
+`test_agentsync.py` (29 cases, isolated per test) covers the protocol (claim/
+block on shared files and dependency-on-WIP, force override, done-claims-don't-
+block, status validation), **path-aware overlap** (directory containment, globs,
+normalization, disjoint-dirs-are-clean), conflict detection (textual conflict and
+clean-merge), the **compare-and-swap guarantee** (a peer claim landing mid-flight
+both survives our retry and is observed in time to block a collision), liveness
+(`release`, `stale` flagging, the duplicate-id warning), error paths, and
+provisioning + `add_collaborator` (single and multi-invite, partner-from-env,
+existing-remote skip, invite-failure reporting, bad-permission, no-remote) with
+the `gh` CLI stubbed so no real GitHub repo is touched. `test_workflow.py` (5
+cases) drives the full two-person lifecycle and the real MCP stdio transport as a
+subprocess. CI runs both on every push via [GitHub Actions](.github/workflows/test.yml).
 
 ## Limitations
 

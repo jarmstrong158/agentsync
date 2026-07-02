@@ -120,6 +120,37 @@ Either makes `claim()` return `blocked` with the specifics, unless `force=True`.
 This is the literal encoding of "as long as it doesn't rely on or get in the
 way of what they build."
 
+**The intersection is path-aware, not string-equality.** Plain `set(a) & set(b)`
+was a silent-wrong trap: a directory claim `src/api` would *not* register against
+`src/api/routes.py`, and `./auth.py` read as different from `auth.py`. So `∩` is
+implemented by `_paths_overlap`, which (after normalizing slashes / `./` / dup
+separators / trailing `/`) matches on three grounds: exact equality, directory
+containment (one path is an ancestor of the other), and glob (`src/**`, `*.py`)
+in either direction. This makes coarse, natural claims (`"src/api"`, `"**/*.sql"`)
+actually protect what they name instead of quietly protecting nothing.
+
+## Decision 6 — liveness: release, staleness, and the shared-id guard
+
+The claim registry is only useful if it reflects *live* intent. Three failure
+modes erode that, each with a minimal countermeasure:
+
+- **Abandoned claims.** An agent that crashes or wanders off leaves its files
+  locked forever — `done` was the only exit. `release()` adds the missing verb:
+  drop a claim without finishing it, freeing the files. It just deletes your own
+  key and pushes (same CAS loop as every other write).
+- **Silent staleness.** Even un-abandoned, a claim sitting untouched for days is
+  a smell. Rather than auto-expire (which would race a slow-but-alive partner),
+  `survey()` *surfaces* age: every entry gets `age_hours` + a `stale` flag
+  (in-progress and older than `AGENTSYNC_STALE_HOURS`, default 24h), plus a
+  top-level `stale_claims` list. The judgment call — nudge them, or `force` past
+  it — stays with the agent; the server only makes the staleness visible.
+- **Shared agent id.** Two people who both set `AGENTSYNC_AGENT_ID="claude"`
+  write to the same key and clobber each other with no error. Each server process
+  stamps a random `instance` token on the claims it writes; `claim()` warns (non-
+  fatally) when the id it's about to take is already held in-progress by a
+  *different* instance. It's advisory, not a hard block, so a legitimate server
+  restart doesn't wedge you — it just points at the real fix: unique ids.
+
 ## Conflict detection — two levels
 
 1. **Intent / claim overlap** — set intersection of declared files. Version-

@@ -544,6 +544,154 @@ def test_add_collaborator_no_remote():
 
 
 # --------------------------------------------------------------------------- #
+# path / glob overlap
+# --------------------------------------------------------------------------- #
+def test_block_on_directory_containment():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("api", ["src/api"], branch="jonny/api")
+        be(clones, "partner")
+        r = json.loads(M.claim("route", ["src/api/routes.py"],
+                               branch="partner/route"))
+        assert r["status"] == "blocked", r
+        files = r["conflicts"]["jonny"]["reasons"][0]["files"]
+        assert "src/api/routes.py" in files, r
+
+
+def test_block_on_glob():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("all-src", ["src/**"], branch="jonny/src")
+        be(clones, "partner")
+        r = json.loads(M.claim("model", ["src/models/user.py"],
+                               branch="partner/model"))
+        assert r["status"] == "blocked", r
+
+
+def test_path_normalization_overlap():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("auth", ["./auth.py"], branch="jonny/auth")
+        be(clones, "partner")
+        r = json.loads(M.claim("auth2", ["auth.py"], branch="partner/auth"))
+        assert r["status"] == "blocked", r
+
+
+def test_disjoint_directories_are_clean():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("api", ["src/api"], branch="jonny/api")
+        be(clones, "partner")
+        r = json.loads(M.claim("web", ["src/web"], branch="partner/web"))
+        assert r["status"] == "claimed", r
+
+
+# --------------------------------------------------------------------------- #
+# release + staleness + duplicate-id guard
+# --------------------------------------------------------------------------- #
+def test_release_frees_the_file():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("auth", ["auth.py"], branch="jonny/auth")
+        r = json.loads(M.release())
+        assert r["status"] == "released", r
+        # releasing again is a no-op, not an error
+        assert json.loads(M.release())["status"] == "noop"
+        # partner can now take the freed file
+        be(clones, "partner")
+        r = json.loads(M.claim("auth2", ["auth.py"], branch="partner/auth"))
+        assert r["status"] == "claimed", r
+
+
+def test_survey_flags_stale_claim():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.survey()  # create the coordination branch
+        scratch = os.path.join(root, "scratch")
+        git(["clone", "-q", origin, scratch], root)
+        peer_push_claim(scratch, "agentsync", "sleepy", {
+            "task": "long-gone", "touches": ["old.py"], "requires": [],
+            "branch": "sleepy/x", "status": "in-progress",
+            "updated_at": "2000-01-01T00:00:00+00:00", "note": None,
+        })
+        be(clones, "jonny")
+        s = json.loads(M.survey())
+        assert "sleepy" in s["stale_claims"], s
+        assert s["partners"]["sleepy"]["stale"] is True, s
+        assert s["partners"]["sleepy"]["age_hours"] > 24, s
+
+
+def test_duplicate_agent_id_warns():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.survey()
+        scratch = os.path.join(root, "scratch")
+        git(["clone", "-q", origin, scratch], root)
+        # an entry under "jonny" written by a *different* instance
+        peer_push_claim(scratch, "agentsync", "jonny", {
+            "task": "someone-elses", "touches": ["z.py"], "requires": [],
+            "branch": "other/z", "status": "in-progress",
+            "updated_at": M._now(), "instance": "deadbeef", "note": None,
+        })
+        be(clones, "jonny")
+        r = json.loads(M.claim("mine", ["a.py"], branch="jonny/a"))
+        assert r["status"] == "claimed", r
+        assert "warning" in r and "unique" in r["warning"].lower(), r
+
+
+# --------------------------------------------------------------------------- #
+# multi-collaborator invites
+# --------------------------------------------------------------------------- #
+def test_add_multiple_collaborators():
+    root = tempfile.mkdtemp(prefix="agentsync_collab_")
+    try:
+        repo = os.path.join(root, "proj")
+        os.makedirs(repo)
+        git(["init", "-q", "-b", "main"], repo)
+        invites = []
+
+        def fake_gh(args, cwd=None, check=True):
+            if args[:2] == ["repo", "view"]:
+                return SimpleNamespace(returncode=0, stdout="tester/proj\n",
+                                       stderr="")
+            if args[:3] == ["api", "-X", "PUT"]:
+                invites.append(args[3].rsplit("/", 1)[-1])
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected gh call: {args}")
+
+        M._gh = fake_gh
+        os.environ["AGENTSYNC_REPO"] = repo
+        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+
+        r = json.loads(M.add_collaborator("alice, bob carol"))
+        assert r["status"] == "invited", r
+        assert len(r["results"]) == 3, r
+        assert set(invites) == {"alice", "bob", "carol"}, invites
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_provision_invites_multiple_partners():
+    root = tempfile.mkdtemp(prefix="agentsync_prov_")
+    try:
+        record, bare_for = install_gh_stub(root)
+        repo_path = os.path.join(root, "team-project")
+        os.environ["AGENTSYNC_REPO"] = repo_path
+        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+
+        r = json.loads(M.provision(repo="tester/team-project",
+                                   partner_github="alice bob"))
+        assert r["status"] == "provisioned", r
+        assert r["partner_invited"] is True, r
+        assert len(r["partners_invited"]) == 2, r
+        assert set(record["invites"]) == {"alice", "bob"}, record
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # runner
 # --------------------------------------------------------------------------- #
 TESTS = [
@@ -567,6 +715,15 @@ TESTS = [
     test_provision_reports_invite_failure,
     test_add_collaborator,
     test_add_collaborator_no_remote,
+    test_block_on_directory_containment,
+    test_block_on_glob,
+    test_path_normalization_overlap,
+    test_disjoint_directories_are_clean,
+    test_release_frees_the_file,
+    test_survey_flags_stale_claim,
+    test_duplicate_agent_id_warns,
+    test_add_multiple_collaborators,
+    test_provision_invites_multiple_partners,
 ]
 
 

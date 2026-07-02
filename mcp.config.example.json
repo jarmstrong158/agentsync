@@ -12,6 +12,7 @@
         "_optional": "defaults shown below; omit unless you need to change them",
         "AGENTSYNC_REMOTE": "origin",
         "AGENTSYNC_BRANCH": "agentsync",
+        "AGENTSYNC_STALE_HOURS": "24",
 
         "_provision": "only used by provision() when bootstrapping a brand-new repo; the partner you'll invite as a collaborator",
         "AGENTSYNC_PARTNER_GITHUB": "their-github-username"

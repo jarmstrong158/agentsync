@@ -38,10 +38,12 @@ Config (environment, set in the MCP client config)
                               as a collaborator by provision()   (optional)
 """
 
+import fnmatch
 import json
 import os
 import subprocess
 import time
+import uuid
 from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
@@ -50,6 +52,15 @@ mcp = FastMCP("agentsync")
 
 CLAIMS_FILE = "claims.json"
 PUSH_RETRIES = 5
+
+# A random token per running server process. Stamped onto every claim this
+# process writes so we can detect when a second collaborator has picked the same
+# AGENTSYNC_AGENT_ID (they'd otherwise silently overwrite each other's entry).
+INSTANCE = uuid.uuid4().hex[:8]
+
+# An in-progress claim older than this many hours is flagged 'stale' by survey()
+# — the signal that a partner may have crashed or wandered off holding files.
+STALE_HOURS = float(os.environ.get("AGENTSYNC_STALE_HOURS", "24"))
 
 # Any single git/gh invocation is bounded so a stuck network call or an
 # un-answerable credential prompt fails fast instead of hanging the MCP server.
@@ -237,6 +248,47 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _age_hours(entry):
+    """Hours since a claim was last updated, or None if the timestamp is
+    missing/unparseable (so test fixtures with placeholder stamps don't crash)."""
+    ts = entry.get("updated_at")
+    if not ts:
+        return None
+    try:
+        then = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - then).total_seconds() / 3600.0
+
+
+def _annotate(entry):
+    """Return a shallow copy of a claim with derived age/stale fields for
+    display — never mutates the stored claim."""
+    view = dict(entry)
+    age = _age_hours(entry)
+    view["age_hours"] = None if age is None else round(age, 1)
+    view["stale"] = bool(
+        age is not None and age > STALE_HOURS and entry.get("status") != "done"
+    )
+    return view
+
+
+def _split_users(s):
+    """Parse one or more GitHub usernames from a comma/space/newline-separated
+    string. Lets a single tool arg invite a whole team at once."""
+    if not s:
+        return []
+    parts = s.replace(",", " ").split()
+    seen, out = set(), []
+    for u in parts:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
 def _commit_and_push(cfg, message):
     """Commit claims.json and push. Returns True on success, False if the push
     was rejected (someone else pushed first -> caller should retry)."""
@@ -257,20 +309,77 @@ def _commit_and_push(cfg, message):
 # --------------------------------------------------------------------------- #
 # overlap logic
 # --------------------------------------------------------------------------- #
+_GLOB_CHARS = set("*?[")
+
+
+def _norm_path(p):
+    """Normalize a claimed path for comparison: forward slashes, no leading
+    './', no trailing '/', no duplicate separators. This is what makes
+    'auth.py', './auth.py', and 'src//auth.py' compare as the same thing."""
+    p = (p or "").strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    while "//" in p:
+        p = p.replace("//", "/")
+    return p.rstrip("/")
+
+
+def _is_glob(p):
+    return any(c in _GLOB_CHARS for c in p)
+
+
+def _glob_match(pattern, path):
+    # fnmatch's '*' already spans '/', so a directory glob like 'src/**' matches
+    # 'src/a/b.py'. Collapse '**' to '*' so an explicit '**' behaves the same.
+    pat = pattern.replace("**", "*")
+    return fnmatch.fnmatch(path, pat)
+
+
+def _paths_overlap(a, b):
+    """True if two claimed paths refer to overlapping work. Beyond exact match
+    this catches directory containment ('src/api' vs 'src/api/routes.py') and
+    globs ('src/**', '*.py') in either direction — the cases plain string
+    intersection silently missed."""
+    a, b = _norm_path(a), _norm_path(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # directory containment, either direction
+    if b.startswith(a + "/") or a.startswith(b + "/"):
+        return True
+    # glob, either direction
+    if _is_glob(a) and _glob_match(a, b):
+        return True
+    if _is_glob(b) and _glob_match(b, a):
+        return True
+    return False
+
+
+def _match_files(mine, theirs):
+    """The declared paths (from both sides) that overlap — the specifics we
+    report back so the caller sees exactly what collided."""
+    hits = set()
+    for m in mine:
+        for t in theirs:
+            if _paths_overlap(m, t):
+                hits.add(m)
+                hits.add(t)
+    return sorted(hits)
+
+
 def _overlap(my_touches, my_requires, peer):
     """Return reasons this agent's plan conflicts with a peer's active claim."""
     if peer.get("status") == "done":
         return []
-    pt = set(peer.get("touches", []))
+    pt = list(peer.get("touches", []))
     reasons = []
-    both_touch = set(my_touches) & pt
+    both_touch = _match_files(my_touches, pt)
     if both_touch:
-        reasons.append({"type": "shared_files", "files": sorted(both_touch)})
-    dep_on_wip = set(my_requires) & pt
+        reasons.append({"type": "shared_files", "files": both_touch})
+    dep_on_wip = _match_files(my_requires, pt)
     if dep_on_wip:
-        reasons.append(
-            {"type": "depends_on_their_wip", "files": sorted(dep_on_wip)}
-        )
+        reasons.append({"type": "depends_on_their_wip", "files": dep_on_wip})
     return reasons
 
 
@@ -332,21 +441,25 @@ def _repo_slug(repo_path):
 
 @mcp.tool()
 def add_collaborator(github_username: str, permission: str = "push") -> str:
-    """Invite someone as a collaborator on the shared repo so they can push to
-    it. Use this when the repo already exists and you just want to grant a
-    partner access (provision() does this too, but only as part of first-time
-    setup).
+    """Invite one or more people as collaborators on the shared repo so they can
+    push to it. Use this when the repo already exists and you just want to grant
+    partners access (provision() does this too, but only as part of first-time
+    setup). This is how you build a team of more than two.
 
-    github_username : the GitHub user to invite (e.g. "jarmstrong158").
+    github_username : one or more GitHub users, comma- or space-separated
+                      (e.g. "jarmstrong158" or "alice, bob, carol").
     permission      : pull | triage | push | maintain | admin  (default push).
 
-    The invited user must accept the GitHub invitation before they can push.
+    Each invited user must accept the GitHub invitation before they can push.
     Requires the `gh` CLI authenticated with admin on the repo. Returns the
-    clone URL to hand the new collaborator."""
+    clone URL to hand the new collaborators."""
     if permission not in VALID_PERMISSIONS:
         return json.dumps(
             {"error": f"permission must be one of {', '.join(VALID_PERMISSIONS)}"}
         )
+    users = _split_users(github_username)
+    if not users:
+        return json.dumps({"error": "No GitHub username given."})
     cfg = _cfg()
     slug = _repo_slug(cfg["repo"])
     if not slug:
@@ -354,20 +467,24 @@ def add_collaborator(github_username: str, permission: str = "push") -> str:
             {"error": "Could not determine the GitHub repo from this clone's "
              "'origin' remote. Is it a GitHub repo with a remote set?"}
         )
-    ok, msg = _invite_collaborator(slug, github_username, permission)
+    results = []
+    for user in users:
+        ok, msg = _invite_collaborator(slug, user, permission)
+        results.append({"collaborator": user, "invited": ok, "message": msg})
+    any_ok = any(r["invited"] for r in results)
+    clone_url = f"https://github.com/{slug}.git"
     return json.dumps(
         {
-            "status": "invited" if ok else "failed",
+            "status": "invited" if any_ok else "failed",
             "repo": slug,
-            "collaborator": github_username,
             "permission": permission,
-            "message": msg,
-            "clone_url": f"https://github.com/{slug}.git",
+            "results": results,
+            "clone_url": clone_url,
             "next": (
-                f"Tell {github_username} to accept the invite (GitHub email/"
-                f"notification), then `git clone https://github.com/{slug}.git` "
-                "and point their agentsync server at that clone."
-            ) if ok else None,
+                f"Tell each invitee to accept the GitHub invite, then "
+                f"`git clone {clone_url}` and point their agentsync server at "
+                "that clone with a UNIQUE AGENTSYNC_AGENT_ID."
+            ) if any_ok else None,
         },
         indent=2,
     )
@@ -392,21 +509,22 @@ def provision(
          wire up the 'origin' remote, or reuse an existing remote/repo.
       3. Push the default branch.
       4. Seed the coordination branch (agentsync) with an empty claims.json.
-      5. Invite the partner as a push collaborator, if a username is given here
-         or via AGENTSYNC_PARTNER_GITHUB.
+      5. Invite the partner(s) as push collaborators, if any usernames are given
+         here or via AGENTSYNC_PARTNER_GITHUB.
 
     repo            : 'owner/name', bare 'name' (owner = you), or '' to use the
                       AGENTSYNC_REPO folder name.
-    partner_github  : partner's GitHub username to invite (overrides env).
+    partner_github  : one or more GitHub usernames to invite, comma- or
+                      space-separated (overrides env). Supports a whole team.
     private         : create the repo private (default) or public.
     description     : optional GitHub repo description.
 
     Requires the `gh` CLI, authenticated (`gh auth login`) with 'repo' scope.
     Returns a summary of what was created plus the clone URL to send your
-    partner."""
+    partners."""
     cfg = _cfg(require_git=False)
     repo_path, remote = cfg["repo"], cfg["remote"]
-    partner = partner_github or cfg["partner_github"]
+    partners = _split_users(partner_github or cfg["partner_github"])
     steps = []
 
     # 1. local repo + a commit so a default branch exists
@@ -460,10 +578,11 @@ def provision(
     _ensure_worktree(seed_cfg)
     steps.append(f"seeded coordination branch '{seed_cfg['branch']}'")
 
-    # 5. invite the partner
-    invited_ok = False
-    if partner:
-        invited_ok, invite = _invite_collaborator(slug, partner)
+    # 5. invite the partner(s)
+    invited = []
+    for partner in partners:
+        ok, invite = _invite_collaborator(slug, partner)
+        invited.append({"collaborator": partner, "invited": ok, "message": invite})
         steps.append(invite)
 
     clone_url = f"https://github.com/{slug}.git"
@@ -475,11 +594,13 @@ def provision(
             "default_branch": default_branch,
             "coordination_branch": seed_cfg["branch"],
             "steps": steps,
-            "partner_invited": invited_ok,
+            "partners_invited": invited,
+            "partner_invited": any(p["invited"] for p in invited),
             "next": (
-                f"Send your partner: `git clone {clone_url}` (they accept the "
-                "GitHub invite first), then both add the agentsync MCP server "
-                "pointed at their own clone and call survey()."
+                f"Send each partner: `git clone {clone_url}` (they accept the "
+                "GitHub invite first), then everyone adds the agentsync MCP "
+                "server pointed at their own clone with a UNIQUE "
+                "AGENTSYNC_AGENT_ID and calls survey()."
             ),
         },
         indent=2,
@@ -493,13 +614,24 @@ def provision(
 def survey() -> str:
     """Pull the latest coordination state and report what every *other* agent
     has claimed: task, files touched, dependencies, branch, status, timestamp.
+    Works for any number of collaborators, not just one.
+
+    Each partner entry is annotated with `age_hours` and a `stale` flag (an
+    in-progress claim older than AGENTSYNC_STALE_HOURS, default 24h) so you can
+    spot a partner who may have crashed or wandered off still holding files.
     Call this before planning and again after finishing work."""
     cfg = _cfg()
     _ensure_worktree(cfg)
     claims = _read_claims(cfg)["claims"]
-    others = {k: v for k, v in claims.items() if k != cfg["agent"]}
+    others = {k: _annotate(v) for k, v in claims.items() if k != cfg["agent"]}
+    stale = sorted(k for k, v in others.items() if v["stale"])
     return json.dumps(
-        {"me": cfg["agent"], "branch": cfg["branch"], "partners": others},
+        {
+            "me": cfg["agent"],
+            "branch": cfg["branch"],
+            "partners": others,
+            "stale_claims": stale,
+        },
         indent=2,
     )
 
@@ -529,6 +661,19 @@ def claim(
         _ensure_worktree(cfg)
         data = _read_claims(cfg)
         claims = data["claims"]
+
+        # duplicate-id guard: our id already holds an active claim stamped by a
+        # *different* server process -> likely two people sharing one agent id.
+        prior = claims.get(cfg["agent"])
+        dup_warn = None
+        if (prior and prior.get("instance") and prior.get("instance") != INSTANCE
+                and prior.get("status") == "in-progress"):
+            dup_warn = (
+                f"Agent id '{cfg['agent']}' already holds an in-progress claim "
+                "written by a different agentsync instance. If a teammate is "
+                "using the same AGENTSYNC_AGENT_ID, give each person a unique id "
+                "— otherwise you overwrite each other's claims."
+            )
 
         if not force:
             blocks = {}
@@ -560,14 +705,16 @@ def claim(
             "branch": branch,
             "status": "in-progress",
             "updated_at": _now(),
+            "instance": INSTANCE,
             "note": None,
         }
         with open(os.path.join(cfg["worktree"], CLAIMS_FILE), "w") as f:
             json.dump(data, f, indent=2)
         if _commit_and_push(cfg, f"agentsync: {cfg['agent']} claims '{task}'"):
-            return json.dumps(
-                {"status": "claimed", "claim": claims[cfg["agent"]]}, indent=2
-            )
+            result = {"status": "claimed", "claim": claims[cfg["agent"]]}
+            if dup_warn:
+                result["warning"] = dup_warn
+            return json.dumps(result, indent=2)
         time.sleep(0.4 * (attempt + 1))  # contended; back off and retry
     return json.dumps(
         {"status": "retry_exhausted", "message": "Push kept losing the race; "
@@ -612,7 +759,7 @@ def check_conflicts(against_branch: str = "") -> str:
     _git(["fetch", remote, "--prune"], repo, check=False)
     results = []
     for pid, br, their_touches in targets:
-        overlap = sorted(my_touches & their_touches)
+        overlap = _match_files(my_touches, their_touches)
         # resolve refs (prefer remote-tracking) and dry-run merge
         ref_mine = f"{remote}/{my_branch}"
         ref_their = f"{remote}/{br}"
@@ -662,9 +809,37 @@ def check_conflicts(against_branch: str = "") -> str:
 
 
 @mcp.tool()
+def release(note: str = "") -> str:
+    """Abandon your current claim WITHOUT marking it done, freeing the files you
+    were holding so a partner can take them over. Use this when you're dropping
+    the task or stepping away — otherwise a crashed or abandoned claim blocks
+    those files indefinitely (the only other exits are 'done' or manual git
+    surgery). Pushes immediately."""
+    cfg = _cfg()
+    for attempt in range(PUSH_RETRIES):
+        _ensure_worktree(cfg)
+        data = _read_claims(cfg)
+        if cfg["agent"] not in data["claims"]:
+            return json.dumps(
+                {"status": "noop", "message": "You have no active claim to release."}
+            )
+        released = data["claims"].pop(cfg["agent"])
+        with open(os.path.join(cfg["worktree"], CLAIMS_FILE), "w") as f:
+            json.dump(data, f, indent=2)
+        msg = f"agentsync: {cfg['agent']} releases '{released.get('task')}'"
+        if note:
+            msg += f" ({note})"
+        if _commit_and_push(cfg, msg):
+            return json.dumps({"status": "released", "released": released}, indent=2)
+        time.sleep(0.4 * (attempt + 1))
+    return json.dumps({"status": "retry_exhausted"})
+
+
+@mcp.tool()
 def update_status(status: str, note: str = "") -> str:
     """Update your own claim's status (e.g. 'in-progress' -> 'done') and
-    optionally attach a note for your partner. Pushes immediately."""
+    optionally attach a note for your partner. Pushes immediately.
+    To drop a claim without finishing it, use release() instead."""
     if status not in {"planning", "in-progress", "done"}:
         return json.dumps(
             {"error": "status must be planning | in-progress | done"}
@@ -678,6 +853,7 @@ def update_status(status: str, note: str = "") -> str:
             return json.dumps({"error": "No claim to update. Call claim() first."})
         mine["status"] = status
         mine["updated_at"] = _now()
+        mine["instance"] = INSTANCE
         if note:
             mine["note"] = note
         with open(os.path.join(cfg["worktree"], CLAIMS_FILE), "w") as f:
