@@ -28,8 +28,9 @@ playbook your agent follows to drive the tools.
 pip install -r requirements.txt      # just `mcp`
 ```
 
-For repo provisioning you also need the [GitHub CLI](https://cli.github.com),
-authenticated with `repo` scope:
+For anything that talks to GitHub — provisioning a repo (`provision`), inviting a
+collaborator (`add_collaborator`), or opening a PR (`finish`) — you also need the
+[GitHub CLI](https://cli.github.com), authenticated with `repo` scope:
 
 ```bash
 gh auth login        # one-time; check with `gh auth status`
