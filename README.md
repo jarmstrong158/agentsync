@@ -63,6 +63,7 @@ agent id and their own local clone. See `mcp.config.example.json`:
 | `AGENTSYNC_BRANCH`        | no       | `agentsync` | coordination branch name                   |
 | `AGENTSYNC_PARTNER_GITHUB`| no       | —           | partner GitHub user(s) to invite (comma/space-separated) |
 | `AGENTSYNC_STALE_HOURS`   | no       | `24`        | age after which an in-progress claim is flagged `stale` |
+| `AGENTSYNC_GIT_TIMEOUT`   | no       | `25`        | seconds any single git/gh call may run before it fails fast |
 
 The `agentsync` branch is created automatically on the first `survey()` or
 `claim()` call — no manual setup.
