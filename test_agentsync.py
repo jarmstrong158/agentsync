@@ -793,6 +793,30 @@ def test_finish_requires_pushed_branch():
         assert "error" in r and "push" in r["error"].lower(), r
 
 
+def test_history_survives_smart_quote_in_subject():
+    """Regression: a cp1252-undefined char (smart double-quote U+201D, UTF-8
+    E2 80 9D — the 0x9D byte is undefined in cp1252) in a claim task lands in a
+    git commit subject. history() reads `git log --format=…%s…`; if the git
+    subprocess decodes with the Windows locale default (cp1252) the reader
+    crashes, stdout becomes None, and splitlines() raises AttributeError.
+    With encoding='utf-8', errors='replace' the read must succeed and the text
+    must round-trip."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        task = "fix “smart” quotes"  # curly double-quotes
+        M.claim(task, ["auth.py"], branch="jonny/auth")
+        M.update_status("done")
+        # Must not raise (pre-fix: AttributeError on None.splitlines()).
+        h = json.loads(M.history())
+        subjects = [e["event"] for e in h["events"]]
+        assert any("“smart”" in s for s in subjects), subjects
+        # And the claim itself round-trips through claims.json unchanged.
+        cj = os.path.join(clones["jonny"], ".git", "agentsync-wt", "claims.json")
+        with open(cj, encoding="utf-8") as f:
+            mine = json.load(f)["claims"]["jonny"]
+        assert mine["task"] == task, mine
+
+
 # --------------------------------------------------------------------------- #
 # runner
 # --------------------------------------------------------------------------- #
@@ -831,6 +855,7 @@ TESTS = [
     test_finish_opens_pr_and_marks_done,
     test_finish_returns_existing_pr_url,
     test_finish_requires_pushed_branch,
+    test_history_survives_smart_quote_in_subject,
 ]
 
 

@@ -38,10 +38,12 @@ Config (environment, set in the MCP client config)
                               as a collaborator by provision()   (optional)
 """
 
+import contextlib
 import fnmatch
 import json
 import os
 import subprocess
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -131,6 +133,9 @@ def _git(args, cwd, check=True):
     try:
         p = subprocess.run(
             ["git", *args], cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",   # never decode with the cp1252
+            # locale default: a cp1252-undefined byte (e.g. a smart quote in a
+            # commit subject) would otherwise crash the reader and leave stdout None.
             env=_noninteractive_env(), timeout=GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,   # CRITICAL: never inherit the MCP stdio pipe.
             # Without this, git inherits the server's stdin (the JSON-RPC transport)
@@ -158,6 +163,7 @@ def _gh(args, cwd=None, check=True):
     try:
         p = subprocess.run(
             ["gh", *args], cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",   # never decode with the cp1252 locale default
             timeout=GIT_TIMEOUT, stdin=subprocess.DEVNULL,   # never inherit the MCP stdio pipe
         )
     except FileNotFoundError:
@@ -242,8 +248,7 @@ def _ensure_worktree(cfg):
             base = _default_remote_head(cfg)
             _git(["worktree", "add", "-b", branch, wt, base], cfg["repo"])
             path = os.path.join(wt, CLAIMS_FILE)
-            with open(path, "w") as f:
-                json.dump({"claims": {}}, f, indent=2)
+            _write_claims_atomic(path, {"claims": {}})
             _git(["add", CLAIMS_FILE], wt)
             _git(["commit", "-m", "agentsync: initialize claims"], wt)
             _git(["push", "-u", remote, branch], wt)
@@ -255,14 +260,36 @@ def _ensure_worktree(cfg):
         _git(["reset", "--hard", f"{remote}/{branch}"], wt, check=False)
 
 
+def _write_claims_atomic(path, data):
+    """Write claims.json airtight: dump to a unique temp file in the same
+    directory, then os.replace() over the target. os.replace is atomic on both
+    POSIX and Windows, so a reader (or a crash mid-write) never sees a truncated
+    file. Same-directory temp keeps the rename on one filesystem. The temp name
+    is unique so concurrent writers in the same worktree don't clobber it, and
+    _commit_and_push only `git add`s CLAIMS_FILE, so a stray temp is never staged."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".claims-", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def _read_claims(cfg):
     path = os.path.join(cfg["worktree"], CLAIMS_FILE)
     if not os.path.exists(path):
         return {"claims": {}}
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as e:
+        # Contract preserved (treat as no claims), but make the failure visible —
+        # a corrupt claims.json should not silently read as "nobody holds anything".
+        _log(f"WARNING: could not parse {path}: {e!r} — treating as empty")
         data = {"claims": {}}
     data.setdefault("claims", {})
     return data
@@ -562,7 +589,7 @@ def provision(
         readme = os.path.join(repo_path, "README.md")
         if not os.listdir(repo_path) or not os.path.exists(readme):
             if not os.path.exists(readme):
-                with open(readme, "w") as f:
+                with open(readme, "w", encoding="utf-8") as f:
                     f.write(f"# {os.path.basename(repo_path)}\n")
         _git(["add", "-A"], repo_path)
         _git(["commit", "-m", "Initial commit"], repo_path)
@@ -732,8 +759,7 @@ def claim(
             "instance": INSTANCE,
             "note": None,
         }
-        with open(os.path.join(cfg["worktree"], CLAIMS_FILE), "w") as f:
-            json.dump(data, f, indent=2)
+        _write_claims_atomic(os.path.join(cfg["worktree"], CLAIMS_FILE), data)
         if _commit_and_push(cfg, f"agentsync: {cfg['agent']} claims '{task}'"):
             result = {"status": "claimed", "claim": claims[cfg["agent"]]}
             if dup_warn:
@@ -818,7 +844,16 @@ def check_conflicts(against_branch: str = "") -> str:
                 l for l in mt.stdout.splitlines()[1:]
                 if l.strip() and not l.startswith(noise)
             ]
-            merge = {"conflict": True, "files": files}
+            if files:
+                merge = {"conflict": True, "files": files}
+            else:
+                # rc=1 but every line matched the noise filter: we can't name a
+                # conflicting path, so a bare conflict:true would be misleading.
+                # Downgrade to 'unknown' and surface the raw output to inspect.
+                merge = {"conflict": "unknown",
+                         "note": "merge-tree signalled a conflict but no file "
+                                 "paths survived filtering; inspect raw output",
+                         "raw": mt.stdout.strip()[:300]}
         else:
             merge = {"conflict": "unknown", "detail": mt.stderr.strip()[:300]}
         results.append(
@@ -848,8 +883,7 @@ def release(note: str = "") -> str:
                 {"status": "noop", "message": "You have no active claim to release."}
             )
         released = data["claims"].pop(cfg["agent"])
-        with open(os.path.join(cfg["worktree"], CLAIMS_FILE), "w") as f:
-            json.dump(data, f, indent=2)
+        _write_claims_atomic(os.path.join(cfg["worktree"], CLAIMS_FILE), data)
         msg = f"agentsync: {cfg['agent']} releases '{released.get('task')}'"
         if note:
             msg += f" ({note})"
@@ -882,8 +916,7 @@ def _set_status(cfg, status, note):
                 done_changes = _branch_changes(cfg, mine["branch"])
                 computed = True
             mine["changed_files"] = done_changes
-        with open(os.path.join(cfg["worktree"], CLAIMS_FILE), "w") as f:
-            json.dump(data, f, indent=2)
+        _write_claims_atomic(os.path.join(cfg["worktree"], CLAIMS_FILE), data)
         if _commit_and_push(cfg, f"agentsync: {cfg['agent']} -> {status}"):
             return True, mine
         time.sleep(0.4 * (attempt + 1))
