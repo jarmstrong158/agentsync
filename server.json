@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.jarmstrong158/agentsync",
   "title": "agentsync",
-  "description": "Decentralized multi-agent coordination MCP: claim work, survey peers, detect conflicts, and reconcile via a git branch as compare-and-swap.",
+  "description": "Multi-agent coordination MCP: claim work, survey peers, resolve conflicts via a git branch as CAS.",
   "repository": {
     "url": "https://github.com/jarmstrong158/agentsync",
     "source": "github"
