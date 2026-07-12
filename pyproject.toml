@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentsync-mcp"
+version = "0.1.0"
+description = "Decentralized multi-agent coordination MCP: claim work, survey peers, detect conflicts, and reconcile via a git branch as compare-and-swap"
+readme = "README.md"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE.md"]
+requires-python = ">=3.10"
+authors = [
+    { name = "Jonathan Armstrong", email = "jarmstrong158@gmail.com" },
+]
+keywords = ["mcp", "coordination", "multi-agent", "claude", "model-context-protocol", "agents", "xylem"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Utilities",
+]
+dependencies = ["mcp>=1.2"]
+
+[project.urls]
+Homepage = "https://github.com/jarmstrong158/agentsync"
+Repository = "https://github.com/jarmstrong158/agentsync"
+Issues = "https://github.com/jarmstrong158/agentsync/issues"
+
+[project.scripts]
+agentsync-mcp = "agentsync_server:main"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "agentsync_server.py",
+    "README.md",
+    "DESIGN.md",
+    "LICENSE.md",
+]
+
+[tool.hatch.build.targets.wheel]
+include = [
+    "agentsync_server.py",
+]

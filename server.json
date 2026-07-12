@@ -1,0 +1,41 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.jarmstrong158/agentsync",
+  "title": "agentsync",
+  "description": "Decentralized multi-agent coordination MCP: claim work, survey peers, detect conflicts, and reconcile via a git branch as compare-and-swap.",
+  "repository": {
+    "url": "https://github.com/jarmstrong158/agentsync",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "agentsync-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "AGENTSYNC_REPO",
+          "description": "Absolute path to the shared project git clone used for coordination.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "AGENTSYNC_AGENT_ID",
+          "description": "Your unique agent id, used to key your claims.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "AGENTSYNC_BRANCH",
+          "description": "The dedicated coordination branch (default: agentsync).",
+          "isRequired": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

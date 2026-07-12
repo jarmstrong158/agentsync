@@ -1,5 +1,7 @@
 # agentsync
 
+<!-- mcp-name: io.github.jarmstrong158/agentsync -->
+
 An MCP server that lets two (or more) AI agents collaborate on the **same git
 repository** without stepping on each other. Each agent declares what it's
 building before it builds, sees what its partner has claimed, and detects
