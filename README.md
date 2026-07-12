@@ -185,7 +185,7 @@ python3 test_agentsync.py     # unit + protocol suite (real git repos)
 python3 test_workflow.py      # two-person lifecycle + real MCP stdio transport
 ```
 
-`test_agentsync.py` (34 cases, isolated per test) covers the protocol (claim/
+`test_agentsync.py` (35 cases, isolated per test) covers the protocol (claim/
 block on shared files and dependency-on-WIP, force override, done-claims-don't-
 block, status validation), **path-aware overlap** (directory containment, globs,
 normalization, disjoint-dirs-are-clean), conflict detection (textual conflict and
