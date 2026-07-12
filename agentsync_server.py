@@ -1033,5 +1033,10 @@ def history(limit: int = 20) -> str:
     )
 
 
-if __name__ == "__main__":
+def main():
+    """Console entry point (pip install agentsync-mcp -> `agentsync-mcp`)."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
