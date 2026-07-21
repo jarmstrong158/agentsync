@@ -817,6 +817,24 @@ def test_history_survives_smart_quote_in_subject():
         assert mine["task"] == task, mine
 
 
+def test_xylem_session_pointer_followed_when_repo_unpinned():
+    """With AGENTSYNC_REPO unpinned, _cfg follows the project the Xylem
+    SessionStart hook recorded in the shared pointer (agent id still from env)."""
+    with lab() as (root, origin, clones):
+        os.environ.pop("AGENTSYNC_REPO", None)
+        os.environ["AGENTSYNC_AGENT_ID"] = "jonny"
+        ptr = os.path.join(root, "active_project.json")
+        with open(ptr, "w", encoding="utf-8") as f:
+            json.dump({"project": clones["jonny"]}, f)
+        os.environ["XYLEM_ACTIVE_PROJECT_FILE"] = ptr
+        try:
+            cfg = M._cfg()
+            assert cfg["repo"] == os.path.abspath(clones["jonny"]), cfg
+            assert cfg["agent"] == "jonny", cfg
+        finally:
+            os.environ.pop("XYLEM_ACTIVE_PROJECT_FILE", None)
+
+
 # --------------------------------------------------------------------------- #
 # runner
 # --------------------------------------------------------------------------- #
@@ -856,6 +874,7 @@ TESTS = [
     test_finish_returns_existing_pr_url,
     test_finish_requires_pushed_branch,
     test_history_survives_smart_quote_in_subject,
+    test_xylem_session_pointer_followed_when_repo_unpinned,
 ]
 
 
