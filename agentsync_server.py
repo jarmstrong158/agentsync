@@ -102,8 +102,31 @@ class ConfigError(RuntimeError):
     pass
 
 
+def _xylem_active_project_file():
+    """Path to the shared Xylem session pointer (overridable for tests)."""
+    override = os.environ.get("XYLEM_ACTIVE_PROJECT_FILE")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(os.path.expanduser("~"), ".xylem", "active_project.json")
+
+
+def _xylem_session_project():
+    """The session's project path from the shared Xylem pointer the SessionStart
+    hook writes, or None. Lets a persistent server follow whichever project the
+    session is in when AGENTSYNC_REPO is not pinned. Never raises."""
+    try:
+        with open(_xylem_active_project_file(), encoding="utf-8") as f:
+            proj = json.load(f).get("project")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return proj if isinstance(proj, str) and os.path.isdir(proj) else None
+
+
 def _cfg(require_git=True):
-    repo = os.environ.get("AGENTSYNC_REPO")
+    # AGENTSYNC_REPO (explicit pin) wins; otherwise follow the session's project
+    # recorded by the Xylem SessionStart hook, so one global config coordinates
+    # whichever repo the session is in instead of a frozen install-time path.
+    repo = os.environ.get("AGENTSYNC_REPO") or _xylem_session_project()
     agent = os.environ.get("AGENTSYNC_AGENT_ID")
     if not repo or not agent:
         raise ConfigError(

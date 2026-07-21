@@ -1,0 +1,28 @@
+[
+  {
+    "id": "dec-001-27a1",
+    "summary": "_cfg now falls back to the shared Xylem session pointer (~/.xylem/active_project.json) when AGENTSYNC_REPO is unset, so agentsync coordinates whichever project the session is in instead of requiring a pinned repo.",
+    "problem": "agentsync hard-required AGENTSYNC_REPO, so the Xylem installer pinned it to the install-time $PROJECT_DIR and every session coordinated that one frozen repo. Part of Xylem-stack audit fix 1b (make context-keeper and agentsync follow the session like cambium does).",
+    "why_chosen": "_cfg already reads AGENTSYNC_REPO from the env per call, so adding `or _xylem_session_project()` is a one-line, low-risk change. The pointer is the same shared file context-keeper and the Xylem hook use, honored only when the explicit env pin is absent, so existing pinned setups are unchanged. Agent id still comes from AGENTSYNC_AGENT_ID.",
+    "what_we_tried": "",
+    "tradeoffs": "If neither the env nor the pointer resolves (session not in a project), _cfg raises ConfigError as before \u2014 agentsync needs a repo. _log still reads AGENTSYNC_REPO directly and silently no-ops when unpinned, acceptable for a breadcrumb log.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "agentsync",
+      "resolution",
+      "xylem",
+      "session",
+      "config"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-21T14:31:25.740224+00:00",
+    "updated_at": "2026-07-21T14:31:25.740224+00:00",
+    "verified_at": "2026-07-21T14:31:25.740224+00:00"
+  }
+]
