@@ -393,7 +393,19 @@ def _write_claims_atomic(path, data):
         raise
 
 
+class ClaimsCorrupt(RuntimeError):
+    """claims.json exists but cannot be trusted. Raised, never swallowed."""
+
+
 def _read_claims(cfg):
+    """The board's live state, or ClaimsCorrupt.
+
+    FAIL CLOSED. An unreadable claims.json used to degrade to {"claims": {}} —
+    "nobody holds anything" — and the very next claim() then wrote a file
+    containing only this agent's entry and pushed it, silently destroying every
+    peer's claim. An absent file legitimately means an empty board; a present
+    but unparseable one means we do not know what the board says, and mutual
+    exclusion cannot be guaranteed from a guess."""
     path = os.path.join(cfg["worktree"], CLAIMS_FILE)
     if not os.path.exists(path):
         return {"claims": {}}
@@ -401,11 +413,31 @@ def _read_claims(cfg):
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
-        # Contract preserved (treat as no claims), but make the failure visible —
-        # a corrupt claims.json should not silently read as "nobody holds anything".
-        _log(f"WARNING: could not parse {path}: {e!r} — treating as empty")
-        data = {"claims": {}}
-    data.setdefault("claims", {})
+        _log(f"CORRUPT {path}: {e!r} — refusing to treat as an empty board")
+        raise ClaimsCorrupt(
+            f"{CLAIMS_FILE} on the '{cfg['branch']}' branch could not be read "
+            f"({e.__class__.__name__}: {e}). Refusing to continue: treating a "
+            "corrupt board as empty would let the next claim overwrite every "
+            f"peer's entry. The file is at {path}. Recover it with "
+            f"`git -C \"{cfg['repo']}\" checkout {cfg['remote']}/{cfg['branch']}"
+            f" -- {CLAIMS_FILE}` in that worktree, or repair the JSON by hand, "
+            "then retry."
+        ) from e
+    if not isinstance(data, dict):
+        _log(f"CORRUPT {path}: top level is {type(data).__name__}, not an object")
+        raise ClaimsCorrupt(
+            f"{CLAIMS_FILE} on the '{cfg['branch']}' branch is a "
+            f"{type(data).__name__}, not a JSON object. Refusing to continue — "
+            "see the recovery note in _read_claims. File: " + path
+        )
+    claims = data.setdefault("claims", {})
+    if not isinstance(claims, dict):
+        _log(f"CORRUPT {path}: 'claims' is {type(claims).__name__}, not an object")
+        raise ClaimsCorrupt(
+            f"{CLAIMS_FILE} on the '{cfg['branch']}' branch has a "
+            f"'claims' key of type {type(claims).__name__}, not an object. "
+            "Refusing to continue. File: " + path
+        )
     return data
 
 

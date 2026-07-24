@@ -818,6 +818,80 @@ def test_history_survives_smart_quote_in_subject():
         assert mine["task"] == task, mine
 
 
+def corrupt_the_board(root, origin, text, branch="agentsync"):
+    """Land arbitrary bytes as claims.json on the coordination branch, as if a
+    half-finished write or a bad merge had corrupted the board. Uses a scratch
+    clone of its own so it never fights an agent clone's agentsync worktree."""
+    scratch = tempfile.mkdtemp(prefix="agentsync_corrupt_", dir=root)
+    wc = os.path.join(scratch, "wc")
+    git(["clone", "-q", "-b", branch, origin, wc], scratch)
+    with open(os.path.join(wc, "claims.json"), "w", encoding="utf-8") as f:
+        f.write(text)
+    git(["add", "claims.json"], wc)
+    git(["commit", "-qm", "corrupt claims"], wc)
+    git(["push", "-q", "origin", branch], wc)
+
+
+def remote_claims_blob(origin, branch="agentsync"):
+    """claims.json exactly as it stands on the shared remote."""
+    return git(["--git-dir", origin, "show", f"{branch}:claims.json"], None).stdout
+
+
+def test_corrupt_claims_fails_closed_and_spares_peer_claims():
+    """A corrupt claims.json used to read as {"claims": {}} — 'nobody holds
+    anything' — and the next claim() wrote a file containing ONLY this agent's
+    entry and pushed it, wiping every peer. Reads must now fail closed, and the
+    board on the remote must be left exactly as it was found."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("auth", ["auth.py"], branch="jonny/auth")   # a real peer claim
+        corrupt = '{"claims": {"jonny": {"task": "auth",'    # truncated mid-write
+        corrupt_the_board(root, origin, corrupt)
+        before = remote_claims_blob(origin)
+        assert "jonny" in before, before
+
+        be(clones, "partner")
+        try:
+            M.survey()
+            assert False, "survey() must not read a corrupt board as empty"
+        except M.ClaimsCorrupt as e:
+            assert "claims.json" in str(e), e
+            assert "peer" in str(e), e   # explains WHY it refuses
+
+        try:
+            M.claim("db", ["db.py"], branch="partner/db")
+            assert False, "claim() must refuse to write over a corrupt board"
+        except M.ClaimsCorrupt:
+            pass
+
+        after = remote_claims_blob(origin)
+        assert after == before, "claim() overwrote a corrupt board:\n%r" % after
+
+
+def test_corrupt_claims_wrong_toplevel_type_fails_closed():
+    """Valid JSON of the wrong shape is corruption too — a list would have
+    .setdefault-crashed or silently yielded an empty board."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("auth", ["auth.py"], branch="jonny/auth")
+        corrupt_the_board(root, origin, '["not", "an", "object"]')
+        be(clones, "partner")
+        try:
+            M.survey()
+            assert False, "expected ClaimsCorrupt for a non-object claims.json"
+        except M.ClaimsCorrupt as e:
+            assert "not a JSON object" in str(e), e
+
+
+def test_missing_claims_file_is_still_an_empty_board():
+    """Fail-closed must not mean fail-always: an ABSENT file legitimately means
+    a board nobody has written to yet."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        cfg = M._cfg()
+        assert M._read_claims(cfg) == {"claims": {}}, "absent != corrupt"
+
+
 @contextlib.contextmanager
 def session_pointer(root, project):
     """Point the shared Xylem session pointer at `project` for the block."""
@@ -923,6 +997,9 @@ TESTS = [
     test_finish_returns_existing_pr_url,
     test_finish_requires_pushed_branch,
     test_history_survives_smart_quote_in_subject,
+    test_corrupt_claims_fails_closed_and_spares_peer_claims,
+    test_corrupt_claims_wrong_toplevel_type_fails_closed,
+    test_missing_claims_file_is_still_an_empty_board,
     test_session_repo_followed_only_when_it_holds_a_board,
     test_session_repo_without_a_board_is_refused_not_silently_used,
     test_board_repo_env_wins_over_session_pointer,
