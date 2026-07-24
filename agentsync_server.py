@@ -565,6 +565,25 @@ def _match_files(mine, theirs):
     return sorted(hits)
 
 
+def _claim_owning_branch(claims, branch, me):
+    """(agent_id, claim) for the peer claim whose branch is `branch`, else
+    (None, None). Prefers an active claim over a finished one, so checking
+    against a branch that has been claimed twice reports the live intent."""
+    want = (branch or "").strip()
+    if not want:
+        return None, None
+    finished = None
+    for pid, c in claims.items():
+        if pid == me or not isinstance(c, dict):
+            continue
+        if (c.get("branch") or "").strip() != want:
+            continue
+        if c.get("status") != "done":
+            return pid, c
+        finished = finished or (pid, c)
+    return finished if finished else (None, None)
+
+
 def _overlap(my_touches, my_requires, peer):
     """Return reasons this agent's plan conflicts with a peer's active claim."""
     if peer.get("status") == "done":
@@ -932,7 +951,12 @@ def check_conflicts(against_branch: str = "") -> str:
 
     against_branch lets you check one specific branch; default checks every
     branch named in a peer's active claim. Your own branch is taken from your
-    current claim."""
+    current claim.
+
+    claim_overlap is intent-level, so it only exists where intent was declared.
+    If against_branch names a branch no active claim mentions, claim_overlap is
+    reported as an explicit {"status": "unknown"} object naming the reason —
+    never as an empty list, which would read as a verified all-clear."""
     cfg = _cfg()
     _ensure_worktree(cfg)
     claims = _read_claims(cfg)["claims"]
@@ -945,7 +969,14 @@ def check_conflicts(against_branch: str = "") -> str:
     my_touches = set(mine.get("touches", []))
 
     if against_branch:
-        targets = [(None, against_branch, set())]
+        # Read the touches off whichever claim actually owns that branch. This
+        # used to be a hardcoded set(), so claim_overlap was ALWAYS empty and
+        # an explicitly targeted check reported "no conflict" unconditionally.
+        owner, peer = _claim_owning_branch(claims, against_branch, cfg["agent"])
+        if peer is None:
+            targets = [(None, against_branch, None)]   # intent unknowable
+        else:
+            targets = [(owner, against_branch, set(peer.get("touches", [])))]
     else:
         targets = [
             (pid, p["branch"], set(p.get("touches", [])))
@@ -959,7 +990,18 @@ def check_conflicts(against_branch: str = "") -> str:
     _git(["fetch", remote, "--prune"], repo, check=False)
     results = []
     for pid, br, their_touches in targets:
-        overlap = _match_files(my_touches, their_touches)
+        if their_touches is None:
+            overlap = {
+                "status": "unknown",
+                "reason": f"no active claim on this board names branch '{br}', "
+                          "so its declared touches are unknown — the "
+                          "intent-level check cannot run. The merge_conflict "
+                          "result below is still authoritative (it is textual).",
+                "fix": "ask that agent to claim(...) with branch=%r, or drop "
+                       "against_branch to check every claimed branch." % br,
+            }
+        else:
+            overlap = _match_files(my_touches, their_touches)
         # resolve refs (prefer remote-tracking) and dry-run merge
         ref_mine = f"{remote}/{my_branch}"
         ref_their = f"{remote}/{br}"

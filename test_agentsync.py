@@ -249,6 +249,37 @@ def test_check_conflicts_partner_branch_not_pushed():
         assert res["claim_overlap"] == [], res
 
 
+def test_check_conflicts_against_branch_reports_real_overlap():
+    """against_branch=X used to hardcode their_touches=set(), so claim_overlap
+    was ALWAYS empty and a targeted check was an unconditional all-clear. It
+    must read the touches off the claim that owns that branch."""
+    with lab() as (root, origin, clones):
+        be(clones, "partner")
+        M.claim("ui", ["src/ui.py", "shared/theme.css"], branch="partner/ui")
+        be(clones, "jonny")
+        M.claim("skin", ["shared/theme.css"], branch="jonny/skin", force=True)
+        res = json.loads(M.check_conflicts(against_branch="partner/ui"))["results"][0]
+        assert res["partner"] == "partner", res
+        assert res["claim_overlap"] == ["shared/theme.css"], res
+        # and the untargeted sweep must agree with the targeted one
+        wide = json.loads(M.check_conflicts())["results"][0]
+        assert wide["claim_overlap"] == res["claim_overlap"], (wide, res)
+
+
+def test_check_conflicts_against_unclaimed_branch_is_unknown_not_clear():
+    """A branch nobody has claimed has no declared intent. Reporting [] there
+    would be a false all-clear; it must say so explicitly."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("skin", ["shared/theme.css"], branch="jonny/skin")
+        res = json.loads(
+            M.check_conflicts(against_branch="somebody/unclaimed"))["results"][0]
+        overlap = res["claim_overlap"]
+        assert isinstance(overlap, dict), overlap
+        assert overlap["status"] == "unknown", overlap
+        assert "no active claim" in overlap["reason"], overlap
+
+
 # --------------------------------------------------------------------------- #
 # compare-and-swap (the core mutual-exclusion guarantee)
 # --------------------------------------------------------------------------- #
@@ -339,16 +370,36 @@ def test_gh_missing_friendly_error():
 # --------------------------------------------------------------------------- #
 # provisioning (gh CLI stubbed; a local bare repo stands in for GitHub)
 # --------------------------------------------------------------------------- #
-def install_gh_stub(root, login="tester"):
+@contextlib.contextmanager
+def patched(**attrs):
+    """Temporarily replace module attributes on the server under test, and
+    ALWAYS put them back. The gh stubs used to be installed permanently, so the
+    suite only passed by the accident of list ordering: any test that ran after
+    a provisioning test was silently talking to a fake gh, and running a single
+    test in isolation (or under pytest -k) could behave differently."""
+    missing = object()
+    saved = {k: getattr(M, k, missing) for k in attrs}
+    for k, v in attrs.items():
+        setattr(M, k, v)
+    try:
+        yield
+    finally:
+        for k, old in saved.items():
+            if old is missing:
+                delattr(M, k)
+            else:
+                setattr(M, k, old)
+
+
+@contextlib.contextmanager
+def gh_stub(root, login="tester"):
+    """A fake `gh` backed by local bare repos, uninstalled on exit."""
     remotes = os.path.join(root, "remotes")
     os.makedirs(remotes, exist_ok=True)
     record = {"created": [], "invites": []}
 
     def bare_for(slug):
         return os.path.join(remotes, slug.replace("/", "__") + ".git")
-
-    M._gh_login = lambda: login
-    M._gh_repo_exists = lambda slug: os.path.isdir(bare_for(slug))
 
     def fake_gh(args, cwd=None, check=True):
         if args[:2] == ["repo", "create"]:
@@ -364,36 +415,39 @@ def install_gh_stub(root, login="tester"):
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected gh call: {args}")
 
-    M._gh = fake_gh
-    return record, bare_for
+    with patched(_gh=fake_gh,
+                 _gh_login=lambda: login,
+                 _gh_repo_exists=lambda slug: os.path.isdir(bare_for(slug))):
+        yield record, bare_for
 
 
 def test_provision_creates_seeds_and_invites():
     root = tempfile.mkdtemp(prefix="agentsync_prov_")
     try:
-        record, bare_for = install_gh_stub(root)
-        repo_path = os.path.join(root, "fresh-project")  # does not exist yet
-        os.environ["AGENTSYNC_REPO"] = repo_path
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+        with gh_stub(root) as (record, bare_for):
+            repo_path = os.path.join(root, "fresh-project")  # does not exist yet
+            os.environ["AGENTSYNC_REPO"] = repo_path
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
-        r = json.loads(M.provision(repo="tester/fresh-project",
-                                   partner_github="buddy"))
-        assert r["status"] == "provisioned", r
-        assert r["repo"] == "tester/fresh-project", r
-        assert r["partner_invited"] is True, r
-        assert "buddy" in record["invites"], record
-        # coordination branch + claims.json landed on the "remote"
-        bare = bare_for("tester/fresh-project")
-        ls = git(["ls-tree", "-r", "--name-only", "agentsync"], bare).stdout
-        assert "claims.json" in ls, ls
-        # idempotent re-run still succeeds and creates nothing new
-        before = list(record["created"])
-        r2 = json.loads(M.provision(repo="tester/fresh-project"))
-        assert r2["status"] == "provisioned", r2
-        assert record["created"] == before, record
-        # the survey protocol now works on the provisioned repo
-        assert json.loads(M.survey())["partners"] == {}
+            r = json.loads(M.provision(repo="tester/fresh-project",
+                                       partner_github="buddy"))
+            assert r["status"] == "provisioned", r
+            assert r["repo"] == "tester/fresh-project", r
+            assert r["partner_invited"] is True, r
+            assert "buddy" in record["invites"], record
+            # coordination branch + claims.json landed on the "remote"
+            bare = bare_for("tester/fresh-project")
+            ls = git(["ls-tree", "-r", "--name-only", "agentsync"], bare).stdout
+            assert "claims.json" in ls, ls
+            # idempotent re-run still succeeds and creates nothing new
+            before = list(record["created"])
+            r2 = json.loads(M.provision(repo="tester/fresh-project"))
+            assert r2["status"] == "provisioned", r2
+            assert record["created"] == before, record
+            # the survey protocol now works on the provisioned repo
+            assert json.loads(M.survey())["partners"] == {}
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -401,17 +455,18 @@ def test_provision_creates_seeds_and_invites():
 def test_provision_partner_from_env():
     root = tempfile.mkdtemp(prefix="agentsync_prov_")
     try:
-        record, _ = install_gh_stub(root)
-        repo_path = os.path.join(root, "envproj")
-        os.environ["AGENTSYNC_REPO"] = repo_path
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ["AGENTSYNC_PARTNER_GITHUB"] = "env-buddy"
-        try:
-            r = json.loads(M.provision(repo="tester/envproj"))
-        finally:
-            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
-        assert r["partner_invited"] is True, r
-        assert "env-buddy" in record["invites"], record
+        with gh_stub(root) as (record, _):
+            repo_path = os.path.join(root, "envproj")
+            os.environ["AGENTSYNC_REPO"] = repo_path
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ["AGENTSYNC_PARTNER_GITHUB"] = "env-buddy"
+            try:
+                r = json.loads(M.provision(repo="tester/envproj"))
+            finally:
+                os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+            assert r["partner_invited"] is True, r
+            assert "env-buddy" in record["invites"], record
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -419,30 +474,32 @@ def test_provision_partner_from_env():
 def test_provision_skips_when_remote_already_configured():
     root = tempfile.mkdtemp(prefix="agentsync_prov_")
     try:
-        record, bare_for = install_gh_stub(root)
-        slug = "tester/preconfigured"
-        bare = bare_for(slug)
-        git(["init", "-q", "--bare", "-b", "main", bare], root)
-        # a local repo that already has a commit and origin set
-        repo_path = os.path.join(root, "preconfigured")
-        os.makedirs(repo_path)
-        git(["init", "-q", "-b", "main"], repo_path)
-        with open(os.path.join(repo_path, "README.md"), "w") as f:
-            f.write("# pre\n")
-        git(["add", "-A"], repo_path)
-        git(["-c", "user.email=t@t.io", "-c", "user.name=t",
-             "commit", "-qm", "init"], repo_path)
-        git(["remote", "add", "origin", bare], repo_path)
-        os.environ["AGENTSYNC_REPO"] = repo_path
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+        with gh_stub(root) as (record, bare_for):
+            slug = "tester/preconfigured"
+            bare = bare_for(slug)
+            git(["init", "-q", "--bare", "-b", "main", bare], root)
+            # a local repo that already has a commit and origin set
+            repo_path = os.path.join(root, "preconfigured")
+            os.makedirs(repo_path)
+            git(["init", "-q", "-b", "main"], repo_path)
+            with open(os.path.join(repo_path, "README.md"), "w") as f:
+                f.write("# pre\n")
+            git(["add", "-A"], repo_path)
+            git(["-c", "user.email=t@t.io", "-c", "user.name=t",
+                 "commit", "-qm", "init"], repo_path)
+            git(["remote", "add", "origin", bare], repo_path)
+            os.environ["AGENTSYNC_REPO"] = repo_path
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
-        r = json.loads(M.provision(repo=slug))
-        assert r["status"] == "provisioned", r
-        assert record["created"] == [], "must not create when remote exists"
-        assert any("remote already configured" in s for s in r["steps"]), r["steps"]
-        ls = git(["ls-tree", "-r", "--name-only", "agentsync"], bare).stdout
-        assert "claims.json" in ls, ls
+            r = json.loads(M.provision(repo=slug))
+            assert r["status"] == "provisioned", r
+            assert record["created"] == [], "must not create when remote exists"
+            assert any("remote already configured" in s for s in r["steps"]), \
+                r["steps"]
+            ls = git(["ls-tree", "-r", "--name-only", "agentsync"], bare).stdout
+            assert "claims.json" in ls, ls
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -450,10 +507,8 @@ def test_provision_skips_when_remote_already_configured():
 def test_provision_reports_invite_failure():
     root = tempfile.mkdtemp(prefix="agentsync_prov_")
     try:
-        install_gh_stub(root)
-        # override only the collaborator PUT to fail
-        real_login = M._gh_login
         remotes = os.path.join(root, "remotes")
+        os.makedirs(remotes, exist_ok=True)
 
         def bare_for(slug):
             return os.path.join(remotes, slug.replace("/", "__") + ".git")
@@ -470,18 +525,20 @@ def test_provision_reports_invite_failure():
                                        stderr="HTTP 404: user not found")
             raise AssertionError(f"unexpected gh call: {args}")
 
-        M._gh = fake_gh
-        repo_path = os.path.join(root, "failinvite")
-        os.environ["AGENTSYNC_REPO"] = repo_path
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+        with patched(_gh=fake_gh, _gh_login=lambda: "tester",
+                     _gh_repo_exists=lambda slug: os.path.isdir(bare_for(slug))):
+            repo_path = os.path.join(root, "failinvite")
+            os.environ["AGENTSYNC_REPO"] = repo_path
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
-        r = json.loads(M.provision(repo="tester/failinvite",
-                                   partner_github="ghost"))
-        # provisioning still succeeds; the invite failure is reported, not fatal
-        assert r["status"] == "provisioned", r
-        assert r["partner_invited"] is False, r
-        assert any("could not invite" in s for s in r["steps"]), r["steps"]
+            r = json.loads(M.provision(repo="tester/failinvite",
+                                       partner_github="ghost"))
+            # provisioning still succeeds; the invite failure is reported, not fatal
+            assert r["status"] == "provisioned", r
+            assert r["partner_invited"] is False, r
+            assert any("could not invite" in s for s in r["steps"]), r["steps"]
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -503,21 +560,22 @@ def test_add_collaborator():
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected gh call: {args}")
 
-        M._gh = fake_gh
-        os.environ["AGENTSYNC_REPO"] = repo
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+        with patched(_gh=fake_gh):
+            os.environ["AGENTSYNC_REPO"] = repo
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
-        r = json.loads(M.add_collaborator("jarmstrong158"))
-        assert r["status"] == "invited", r
-        assert r["repo"] == "tester/proj", r
-        assert r["permission"] == "push", r
-        assert "jarmstrong158" in invites, invites
-        assert r["clone_url"] == "https://github.com/tester/proj.git", r
+            r = json.loads(M.add_collaborator("jarmstrong158"))
+            assert r["status"] == "invited", r
+            assert r["repo"] == "tester/proj", r
+            assert r["permission"] == "push", r
+            assert "jarmstrong158" in invites, invites
+            assert r["clone_url"] == "https://github.com/tester/proj.git", r
 
-        # invalid permission is rejected before any gh call
-        r2 = json.loads(M.add_collaborator("x", permission="superuser"))
-        assert "error" in r2, r2
+            # invalid permission is rejected before any gh call
+            r2 = json.loads(M.add_collaborator("x", permission="superuser"))
+            assert "error" in r2, r2
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -534,12 +592,27 @@ def test_add_collaborator_no_remote():
                 return SimpleNamespace(returncode=1, stdout="", stderr="no repo")
             raise AssertionError(f"unexpected gh call: {args}")
 
-        M._gh = fake_gh
-        os.environ["AGENTSYNC_REPO"] = repo
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+        with patched(_gh=fake_gh):
+            os.environ["AGENTSYNC_REPO"] = repo
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
 
-        r = json.loads(M.add_collaborator("jarmstrong158"))
-        assert "error" in r, r
+            r = json.loads(M.add_collaborator("jarmstrong158"))
+            assert "error" in r, r
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_gh_stubs_are_uninstalled_after_use():
+    """Guards the leak itself: the fake gh must not survive the test that
+    installed it, or the suite passes only by list ordering."""
+    real_gh, real_login = M._gh, M._gh_login
+    root = tempfile.mkdtemp(prefix="agentsync_leak_")
+    try:
+        with gh_stub(root) as (_record, _bare_for):
+            assert M._gh is not real_gh, "stub was not installed"
+        assert M._gh is real_gh, "gh stub leaked out of its context"
+        assert M._gh_login is real_login, "gh_login stub leaked"
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -660,15 +733,16 @@ def test_add_multiple_collaborators():
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected gh call: {args}")
 
-        M._gh = fake_gh
-        os.environ["AGENTSYNC_REPO"] = repo
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+        with patched(_gh=fake_gh):
+            os.environ["AGENTSYNC_REPO"] = repo
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
-        r = json.loads(M.add_collaborator("alice, bob carol"))
-        assert r["status"] == "invited", r
-        assert len(r["results"]) == 3, r
-        assert set(invites) == {"alice", "bob", "carol"}, invites
+            r = json.loads(M.add_collaborator("alice, bob carol"))
+            assert r["status"] == "invited", r
+            assert len(r["results"]) == 3, r
+            assert set(invites) == {"alice", "bob", "carol"}, invites
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -676,18 +750,19 @@ def test_add_multiple_collaborators():
 def test_provision_invites_multiple_partners():
     root = tempfile.mkdtemp(prefix="agentsync_prov_")
     try:
-        record, bare_for = install_gh_stub(root)
-        repo_path = os.path.join(root, "team-project")
-        os.environ["AGENTSYNC_REPO"] = repo_path
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+        with gh_stub(root) as (record, _bare_for):
+            repo_path = os.path.join(root, "team-project")
+            os.environ["AGENTSYNC_REPO"] = repo_path
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
-        r = json.loads(M.provision(repo="tester/team-project",
-                                   partner_github="alice bob"))
-        assert r["status"] == "provisioned", r
-        assert r["partner_invited"] is True, r
-        assert len(r["partners_invited"]) == 2, r
-        assert set(record["invites"]) == {"alice", "bob"}, record
+            r = json.loads(M.provision(repo="tester/team-project",
+                                       partner_github="alice bob"))
+            assert r["status"] == "provisioned", r
+            assert r["partner_invited"] is True, r
+            assert len(r["partners_invited"]) == 2, r
+            assert set(record["invites"]) == {"alice", "bob"}, record
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -973,6 +1048,8 @@ TESTS = [
     test_textual_conflict_detected,
     test_no_textual_conflict_when_disjoint,
     test_check_conflicts_partner_branch_not_pushed,
+    test_check_conflicts_against_branch_reports_real_overlap,
+    test_check_conflicts_against_unclaimed_branch_is_unknown_not_clear,
     test_cas_peer_entry_survives_retry,
     test_cas_colliding_peer_blocks_on_retry,
     test_gh_missing_friendly_error,
@@ -982,6 +1059,7 @@ TESTS = [
     test_provision_reports_invite_failure,
     test_add_collaborator,
     test_add_collaborator_no_remote,
+    test_gh_stubs_are_uninstalled_after_use,
     test_block_on_directory_containment,
     test_block_on_glob,
     test_path_normalization_overlap,
