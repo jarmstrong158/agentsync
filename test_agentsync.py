@@ -77,6 +77,7 @@ def lab():
 def be(clones, who):
     os.environ["AGENTSYNC_REPO"] = clones[who]
     os.environ["AGENTSYNC_AGENT_ID"] = who
+    os.environ.pop("AGENTSYNC_BOARD_REPO", None)
     os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
 
@@ -817,22 +818,70 @@ def test_history_survives_smart_quote_in_subject():
         assert mine["task"] == task, mine
 
 
-def test_xylem_session_pointer_followed_when_repo_unpinned():
-    """With AGENTSYNC_REPO unpinned, _cfg follows the project the Xylem
-    SessionStart hook recorded in the shared pointer (agent id still from env)."""
+@contextlib.contextmanager
+def session_pointer(root, project):
+    """Point the shared Xylem session pointer at `project` for the block."""
+    ptr = os.path.join(root, "active_project.json")
+    with open(ptr, "w", encoding="utf-8") as f:
+        json.dump({"project": project}, f)
+    os.environ["XYLEM_ACTIVE_PROJECT_FILE"] = ptr
+    try:
+        yield ptr
+    finally:
+        os.environ.pop("XYLEM_ACTIVE_PROJECT_FILE", None)
+
+
+def test_session_repo_followed_only_when_it_holds_a_board():
+    """Unpinned, _cfg falls back to the session's project — but ONLY because
+    that clone actually holds the coordination branch. The fallback is
+    self-validating, not a blind follow of the session pointer."""
     with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("seed the board", ["seed.py"], branch="jonny/seed")  # creates it
         os.environ.pop("AGENTSYNC_REPO", None)
         os.environ["AGENTSYNC_AGENT_ID"] = "jonny"
-        ptr = os.path.join(root, "active_project.json")
-        with open(ptr, "w", encoding="utf-8") as f:
-            json.dump({"project": clones["jonny"]}, f)
-        os.environ["XYLEM_ACTIVE_PROJECT_FILE"] = ptr
-        try:
+        with session_pointer(root, clones["jonny"]):
             cfg = M._cfg()
             assert cfg["repo"] == os.path.abspath(clones["jonny"]), cfg
             assert cfg["agent"] == "jonny", cfg
+            assert cfg["board_source"] == "current-repo", cfg
+
+
+def test_session_repo_without_a_board_is_refused_not_silently_used():
+    """THE HEADLINE BUG. A session project with no coordination branch used to
+    be accepted, and every read then reported 'no board' forever. It must now
+    fail loudly with the setting to fix it."""
+    with lab() as (root, origin, clones):
+        os.environ.pop("AGENTSYNC_REPO", None)
+        os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+        os.environ["AGENTSYNC_AGENT_ID"] = "jonny"
+        with session_pointer(root, clones["jonny"]):   # never provisioned
+            try:
+                M._cfg()
+                assert False, "expected ConfigError for a boardless session repo"
+            except M.ConfigError as e:
+                assert "AGENTSYNC_BOARD_REPO" in str(e), e
+                assert "coordination branch" in str(e), e
+
+
+def test_board_repo_env_wins_over_session_pointer():
+    """AGENTSYNC_BOARD_REPO is session-independent by construction: the pointer
+    may say anything, the board address does not move."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("seed the board", ["seed.py"], branch="jonny/seed")
+        os.environ.pop("AGENTSYNC_REPO", None)
+        os.environ["AGENTSYNC_BOARD_REPO"] = clones["jonny"]
+        os.environ["AGENTSYNC_AGENT_ID"] = "partner"
+        try:
+            with session_pointer(root, clones["partner"]):
+                cfg = M._cfg()
+                assert cfg["repo"] == os.path.abspath(clones["jonny"]), cfg
+                assert cfg["board_source"] == "AGENTSYNC_BOARD_REPO", cfg
+            # and the board is visible from it
+            assert M.repo_has_board(cfg["repo"], "origin", "agentsync")
         finally:
-            os.environ.pop("XYLEM_ACTIVE_PROJECT_FILE", None)
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
 
 
 # --------------------------------------------------------------------------- #
@@ -874,7 +923,9 @@ TESTS = [
     test_finish_returns_existing_pr_url,
     test_finish_requires_pushed_branch,
     test_history_survives_smart_quote_in_subject,
-    test_xylem_session_pointer_followed_when_repo_unpinned,
+    test_session_repo_followed_only_when_it_holds_a_board,
+    test_session_repo_without_a_board_is_refused_not_silently_used,
+    test_board_repo_env_wins_over_session_pointer,
 ]
 
 

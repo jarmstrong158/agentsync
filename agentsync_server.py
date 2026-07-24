@@ -30,12 +30,30 @@ survey/claim protocol takes over.
 
 Config (environment, set in the MCP client config)
 --------------------------------------------------
-    AGENTSYNC_REPO      absolute path to the local clone        (required)
+    AGENTSYNC_BOARD_REPO  absolute path to the clone that HOLDS THE BOARD.
+                          The board is a shared, long-lived team artifact, so
+                          this address is deliberately session-independent: it
+                          never follows the Xylem session pointer.
+    AGENTSYNC_REPO      legacy alias for the board address       (equivalent)
     AGENTSYNC_AGENT_ID  this agent's id, e.g. "jonny"           (required)
     AGENTSYNC_REMOTE    remote name                             (default: origin)
     AGENTSYNC_BRANCH    coordination branch                     (default: agentsync)
     AGENTSYNC_PARTNER_GITHUB  partner's GitHub username, invited
                               as a collaborator by provision()   (optional)
+
+Board resolution order (see _resolve_board_repo):
+    1. AGENTSYNC_BOARD_REPO  — the explicit board address.
+    2. AGENTSYNC_REPO        — the legacy explicit pin, same effect.
+    3. the session's / current repo, but ONLY if it actually holds the
+       coordination branch (a self-validating fallback).
+    4. a clear ConfigError naming the setting to set.
+
+Rationale: before this order existed, an unpinned server followed
+~/.xylem/active_project.json, so the board silently changed identity whenever
+the session changed project — and simply vanished (reported as "no coordination
+branch found") in any project that had never been provisioned. cambium's
+distill() applies this exact same order, so the two halves of the suite can
+never disagree about where the board is.
 """
 
 import contextlib
@@ -85,8 +103,9 @@ def _log(msg):
     logging failure must never break a tool call. This is the breadcrumb trail
     that turns 'it hangs' into 'it hung on exactly this git command'."""
     try:
-        repo = os.environ.get("AGENTSYNC_REPO")
-        if not repo:
+        repo = os.environ.get("AGENTSYNC_BOARD_REPO") or os.environ.get(
+            "AGENTSYNC_REPO")
+        if not repo or not os.path.isdir(os.path.join(repo, ".git")):
             return
         line = f"{datetime.now(timezone.utc).isoformat()} {msg}\n"
         with open(os.path.join(repo, ".git", "agentsync.log"), "a", encoding="utf-8") as f:
@@ -122,17 +141,88 @@ def _xylem_session_project():
     return proj if isinstance(proj, str) and os.path.isdir(proj) else None
 
 
-def _cfg(require_git=True):
-    # AGENTSYNC_REPO (explicit pin) wins; otherwise follow the session's project
-    # recorded by the Xylem SessionStart hook, so one global config coordinates
-    # whichever repo the session is in instead of a frozen install-time path.
-    repo = os.environ.get("AGENTSYNC_REPO") or _xylem_session_project()
-    agent = os.environ.get("AGENTSYNC_AGENT_ID")
-    if not repo or not agent:
+def _git_root(start=None):
+    """The git working-tree root at or above `start` (default: cwd), or ""."""
+    d = os.path.abspath(start or os.getcwd())
+    while d:
+        if os.path.isdir(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return ""
+        d = parent
+    return ""
+
+
+def repo_has_board(repo, remote="origin", branch="agentsync"):
+    """True if `repo` actually holds the coordination branch — as a local head,
+    a remote-tracking ref, or on the remote itself. Cheap local ref checks run
+    first; the network ls-remote is a last resort (and bounded by GIT_TIMEOUT).
+
+    This is what makes the "current repo" fallback self-validating: it can only
+    ever select a repo that IS a board, never one that merely happens to be the
+    project this session opened in."""
+    if not repo or not os.path.isdir(os.path.join(repo, ".git")):
+        return False
+    for ref in (f"refs/heads/{branch}", f"refs/remotes/{remote}/{branch}"):
+        p = _git(["rev-parse", "--verify", "--quiet", ref], repo, check=False)
+        if p.returncode == 0 and p.stdout.strip():
+            return True
+    try:
+        p = _git(["ls-remote", "--heads", remote, branch], repo, check=False)
+    except RuntimeError:
+        return False          # timed out / unreachable remote — not a board here
+    return p.returncode == 0 and bool(p.stdout.strip())
+
+
+def _resolve_board_repo(remote="origin", branch="agentsync", require_git=True):
+    """Resolve WHERE THE BOARD LIVES, independently of the session pointer.
+
+    Returns (abs_path, source) where source is one of "AGENTSYNC_BOARD_REPO",
+    "AGENTSYNC_REPO" or "current-repo". Raises ConfigError with an actionable
+    message rather than silently selecting a repo that holds no board.
+
+    cambium._resolve_board_repo mirrors this order exactly; if you change one,
+    change both."""
+    for name in ("AGENTSYNC_BOARD_REPO", "AGENTSYNC_REPO"):
+        v = os.environ.get(name)
+        if v:
+            return os.path.abspath(os.path.expanduser(v)), name
+
+    candidate = _xylem_session_project() or _git_root()
+    if candidate and require_git:
+        cand = os.path.abspath(candidate)
+        if repo_has_board(cand, remote, branch):
+            return cand, "current-repo"
         raise ConfigError(
-            "AGENTSYNC_REPO and AGENTSYNC_AGENT_ID must be set in the MCP config."
+            "No agentsync board found. AGENTSYNC_BOARD_REPO is not set, and the "
+            f"current project ({cand}) has no '{branch}' coordination branch on "
+            f"'{remote}'. The board is a shared, long-lived artifact — it does "
+            "NOT follow whichever project this session happens to be in. Either "
+            "set AGENTSYNC_BOARD_REPO to the absolute path of the clone that "
+            "holds the board, or call provision() to create one here."
         )
-    repo = os.path.abspath(repo)
+    if candidate:
+        return os.path.abspath(candidate), "current-repo"
+    raise ConfigError(
+        "AGENTSYNC_BOARD_REPO must be set in the MCP config — the absolute path "
+        "to the clone holding the coordination branch. (AGENTSYNC_REPO is "
+        "accepted as a legacy alias.)"
+    )
+
+
+def _cfg(require_git=True):
+    agent = os.environ.get("AGENTSYNC_AGENT_ID")
+    if not agent:
+        raise ConfigError(
+            "AGENTSYNC_AGENT_ID must be set in the MCP config."
+        )
+    remote = os.environ.get("AGENTSYNC_REMOTE", "origin")
+    branch = os.environ.get("AGENTSYNC_BRANCH", "agentsync")
+    # The board address is deliberately session-independent — see
+    # _resolve_board_repo. An unpinned server used to follow the Xylem session
+    # pointer blindly, which is how the board went missing for months.
+    repo, board_source = _resolve_board_repo(remote, branch, require_git)
     if require_git and not os.path.isdir(os.path.join(repo, ".git")):
         raise ConfigError(
             f"{repo} is not a git repository (no .git directory). "
@@ -140,9 +230,10 @@ def _cfg(require_git=True):
         )
     return {
         "repo": repo,
+        "board_source": board_source,
         "agent": agent,
-        "remote": os.environ.get("AGENTSYNC_REMOTE", "origin"),
-        "branch": os.environ.get("AGENTSYNC_BRANCH", "agentsync"),
+        "remote": remote,
+        "branch": branch,
         "partner_github": os.environ.get("AGENTSYNC_PARTNER_GITHUB", ""),
         "worktree": os.path.join(repo, ".git", "agentsync-wt"),
     }
@@ -703,6 +794,10 @@ def survey() -> str:
         {
             "me": cfg["agent"],
             "branch": cfg["branch"],
+            # Which board this is, and how it was addressed. Without this a
+            # survey of the WRONG (or an empty, freshly auto-created) board is
+            # indistinguishable from a survey of a quiet team.
+            "board": {"repo": cfg["repo"], "source": cfg["board_source"]},
             "partners": others,
             "stale_claims": stale,
         },

@@ -50,7 +50,7 @@ agent id and their own local clone. See `mcp.config.example.json`:
       "command": "python3",
       "args": ["/abs/path/to/agentsync_server.py"],
       "env": {
-        "AGENTSYNC_REPO": "/abs/path/to/your/clone",
+        "AGENTSYNC_BOARD_REPO": "/abs/path/to/the/clone/holding/the/board",
         "AGENTSYNC_AGENT_ID": "jonny"
       }
     }
@@ -60,7 +60,8 @@ agent id and their own local clone. See `mcp.config.example.json`:
 
 | env var                   | required | default     | meaning                                    |
 |---------------------------|----------|-------------|--------------------------------------------|
-| `AGENTSYNC_REPO`          | yes      | —           | path to your local clone                   |
+| `AGENTSYNC_BOARD_REPO`    | yes\*    | —           | path to the clone that **holds the board** |
+| `AGENTSYNC_REPO`          | no       | —           | legacy alias for `AGENTSYNC_BOARD_REPO`    |
 | `AGENTSYNC_AGENT_ID`      | yes      | —           | your unique agent id                       |
 | `AGENTSYNC_REMOTE`        | no       | `origin`    | git remote name                            |
 | `AGENTSYNC_BRANCH`        | no       | `agentsync` | coordination branch name                   |
@@ -69,13 +70,39 @@ agent id and their own local clone. See `mcp.config.example.json`:
 | `AGENTSYNC_GIT_TIMEOUT`   | no       | `25`        | seconds any single git/gh call may run before it fails fast |
 
 The `agentsync` branch is created automatically on the first `survey()` or
-`claim()` call — no manual setup.
+`claim()` call against an explicitly addressed board — no manual setup.
+
+### Where the board lives (board addressing)
+
+\* The board is a **shared, long-lived team artifact**, not a property of
+whichever repo you happen to be sitting in. So its address is resolved
+independently of the session, in this order:
+
+1. **`AGENTSYNC_BOARD_REPO`** — the explicit board address. This never follows
+   the Xylem session pointer (`~/.xylem/active_project.json`).
+2. **`AGENTSYNC_REPO`** — the legacy explicit pin; identical effect.
+3. **The current repo** (session pointer, else the cwd's git root) — but *only
+   if that repo actually holds the coordination branch*. The check is a real ref
+   lookup (local head → remote-tracking ref → `ls-remote`), so this fallback can
+   only ever select a repo that genuinely **is** a board.
+4. Otherwise a **`ConfigError` naming `AGENTSYNC_BOARD_REPO`** — never a silent
+   selection of a boardless repo.
+
+`survey()` reports the board it actually read under `board: {repo, source}`, so
+"the team is quiet" and "I am looking at the wrong board" are distinguishable.
+
+**Why this order.** Previously an unpinned server followed the session pointer
+blindly. The board therefore changed identity whenever the session changed
+project, and in any project that had never been provisioned it simply
+disappeared — reported downstream as `"no coordination branch found"` and
+treated as normal. cambium's `distill()` applies this **exact same** resolution,
+so the two halves of the suite can never disagree about where the board is.
 
 ## Starting from nothing (no repo yet)
 
 If the shared repo doesn't exist on GitHub yet, **one** person runs `provision()`
-once. Point `AGENTSYNC_REPO` at the folder you want the project in (it can be
-empty or not yet created) and call:
+once. Point `AGENTSYNC_BOARD_REPO` at the folder you want the project in (it can
+be empty or not yet created) and call:
 
 ```
 provision(repo="you/our-project", partner_github="their-username")
