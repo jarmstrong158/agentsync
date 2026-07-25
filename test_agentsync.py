@@ -77,6 +77,7 @@ def lab():
 def be(clones, who):
     os.environ["AGENTSYNC_REPO"] = clones[who]
     os.environ["AGENTSYNC_AGENT_ID"] = who
+    os.environ.pop("AGENTSYNC_BOARD_REPO", None)
     os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
 
@@ -248,6 +249,37 @@ def test_check_conflicts_partner_branch_not_pushed():
         assert res["claim_overlap"] == [], res
 
 
+def test_check_conflicts_against_branch_reports_real_overlap():
+    """against_branch=X used to hardcode their_touches=set(), so claim_overlap
+    was ALWAYS empty and a targeted check was an unconditional all-clear. It
+    must read the touches off the claim that owns that branch."""
+    with lab() as (root, origin, clones):
+        be(clones, "partner")
+        M.claim("ui", ["src/ui.py", "shared/theme.css"], branch="partner/ui")
+        be(clones, "jonny")
+        M.claim("skin", ["shared/theme.css"], branch="jonny/skin", force=True)
+        res = json.loads(M.check_conflicts(against_branch="partner/ui"))["results"][0]
+        assert res["partner"] == "partner", res
+        assert res["claim_overlap"] == ["shared/theme.css"], res
+        # and the untargeted sweep must agree with the targeted one
+        wide = json.loads(M.check_conflicts())["results"][0]
+        assert wide["claim_overlap"] == res["claim_overlap"], (wide, res)
+
+
+def test_check_conflicts_against_unclaimed_branch_is_unknown_not_clear():
+    """A branch nobody has claimed has no declared intent. Reporting [] there
+    would be a false all-clear; it must say so explicitly."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("skin", ["shared/theme.css"], branch="jonny/skin")
+        res = json.loads(
+            M.check_conflicts(against_branch="somebody/unclaimed"))["results"][0]
+        overlap = res["claim_overlap"]
+        assert isinstance(overlap, dict), overlap
+        assert overlap["status"] == "unknown", overlap
+        assert "no active claim" in overlap["reason"], overlap
+
+
 # --------------------------------------------------------------------------- #
 # compare-and-swap (the core mutual-exclusion guarantee)
 # --------------------------------------------------------------------------- #
@@ -338,16 +370,36 @@ def test_gh_missing_friendly_error():
 # --------------------------------------------------------------------------- #
 # provisioning (gh CLI stubbed; a local bare repo stands in for GitHub)
 # --------------------------------------------------------------------------- #
-def install_gh_stub(root, login="tester"):
+@contextlib.contextmanager
+def patched(**attrs):
+    """Temporarily replace module attributes on the server under test, and
+    ALWAYS put them back. The gh stubs used to be installed permanently, so the
+    suite only passed by the accident of list ordering: any test that ran after
+    a provisioning test was silently talking to a fake gh, and running a single
+    test in isolation (or under pytest -k) could behave differently."""
+    missing = object()
+    saved = {k: getattr(M, k, missing) for k in attrs}
+    for k, v in attrs.items():
+        setattr(M, k, v)
+    try:
+        yield
+    finally:
+        for k, old in saved.items():
+            if old is missing:
+                delattr(M, k)
+            else:
+                setattr(M, k, old)
+
+
+@contextlib.contextmanager
+def gh_stub(root, login="tester"):
+    """A fake `gh` backed by local bare repos, uninstalled on exit."""
     remotes = os.path.join(root, "remotes")
     os.makedirs(remotes, exist_ok=True)
     record = {"created": [], "invites": []}
 
     def bare_for(slug):
         return os.path.join(remotes, slug.replace("/", "__") + ".git")
-
-    M._gh_login = lambda: login
-    M._gh_repo_exists = lambda slug: os.path.isdir(bare_for(slug))
 
     def fake_gh(args, cwd=None, check=True):
         if args[:2] == ["repo", "create"]:
@@ -363,36 +415,39 @@ def install_gh_stub(root, login="tester"):
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected gh call: {args}")
 
-    M._gh = fake_gh
-    return record, bare_for
+    with patched(_gh=fake_gh,
+                 _gh_login=lambda: login,
+                 _gh_repo_exists=lambda slug: os.path.isdir(bare_for(slug))):
+        yield record, bare_for
 
 
 def test_provision_creates_seeds_and_invites():
     root = tempfile.mkdtemp(prefix="agentsync_prov_")
     try:
-        record, bare_for = install_gh_stub(root)
-        repo_path = os.path.join(root, "fresh-project")  # does not exist yet
-        os.environ["AGENTSYNC_REPO"] = repo_path
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+        with gh_stub(root) as (record, bare_for):
+            repo_path = os.path.join(root, "fresh-project")  # does not exist yet
+            os.environ["AGENTSYNC_REPO"] = repo_path
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
-        r = json.loads(M.provision(repo="tester/fresh-project",
-                                   partner_github="buddy"))
-        assert r["status"] == "provisioned", r
-        assert r["repo"] == "tester/fresh-project", r
-        assert r["partner_invited"] is True, r
-        assert "buddy" in record["invites"], record
-        # coordination branch + claims.json landed on the "remote"
-        bare = bare_for("tester/fresh-project")
-        ls = git(["ls-tree", "-r", "--name-only", "agentsync"], bare).stdout
-        assert "claims.json" in ls, ls
-        # idempotent re-run still succeeds and creates nothing new
-        before = list(record["created"])
-        r2 = json.loads(M.provision(repo="tester/fresh-project"))
-        assert r2["status"] == "provisioned", r2
-        assert record["created"] == before, record
-        # the survey protocol now works on the provisioned repo
-        assert json.loads(M.survey())["partners"] == {}
+            r = json.loads(M.provision(repo="tester/fresh-project",
+                                       partner_github="buddy"))
+            assert r["status"] == "provisioned", r
+            assert r["repo"] == "tester/fresh-project", r
+            assert r["partner_invited"] is True, r
+            assert "buddy" in record["invites"], record
+            # coordination branch + claims.json landed on the "remote"
+            bare = bare_for("tester/fresh-project")
+            ls = git(["ls-tree", "-r", "--name-only", "agentsync"], bare).stdout
+            assert "claims.json" in ls, ls
+            # idempotent re-run still succeeds and creates nothing new
+            before = list(record["created"])
+            r2 = json.loads(M.provision(repo="tester/fresh-project"))
+            assert r2["status"] == "provisioned", r2
+            assert record["created"] == before, record
+            # the survey protocol now works on the provisioned repo
+            assert json.loads(M.survey())["partners"] == {}
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -400,17 +455,18 @@ def test_provision_creates_seeds_and_invites():
 def test_provision_partner_from_env():
     root = tempfile.mkdtemp(prefix="agentsync_prov_")
     try:
-        record, _ = install_gh_stub(root)
-        repo_path = os.path.join(root, "envproj")
-        os.environ["AGENTSYNC_REPO"] = repo_path
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ["AGENTSYNC_PARTNER_GITHUB"] = "env-buddy"
-        try:
-            r = json.loads(M.provision(repo="tester/envproj"))
-        finally:
-            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
-        assert r["partner_invited"] is True, r
-        assert "env-buddy" in record["invites"], record
+        with gh_stub(root) as (record, _):
+            repo_path = os.path.join(root, "envproj")
+            os.environ["AGENTSYNC_REPO"] = repo_path
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ["AGENTSYNC_PARTNER_GITHUB"] = "env-buddy"
+            try:
+                r = json.loads(M.provision(repo="tester/envproj"))
+            finally:
+                os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+            assert r["partner_invited"] is True, r
+            assert "env-buddy" in record["invites"], record
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -418,30 +474,32 @@ def test_provision_partner_from_env():
 def test_provision_skips_when_remote_already_configured():
     root = tempfile.mkdtemp(prefix="agentsync_prov_")
     try:
-        record, bare_for = install_gh_stub(root)
-        slug = "tester/preconfigured"
-        bare = bare_for(slug)
-        git(["init", "-q", "--bare", "-b", "main", bare], root)
-        # a local repo that already has a commit and origin set
-        repo_path = os.path.join(root, "preconfigured")
-        os.makedirs(repo_path)
-        git(["init", "-q", "-b", "main"], repo_path)
-        with open(os.path.join(repo_path, "README.md"), "w") as f:
-            f.write("# pre\n")
-        git(["add", "-A"], repo_path)
-        git(["-c", "user.email=t@t.io", "-c", "user.name=t",
-             "commit", "-qm", "init"], repo_path)
-        git(["remote", "add", "origin", bare], repo_path)
-        os.environ["AGENTSYNC_REPO"] = repo_path
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+        with gh_stub(root) as (record, bare_for):
+            slug = "tester/preconfigured"
+            bare = bare_for(slug)
+            git(["init", "-q", "--bare", "-b", "main", bare], root)
+            # a local repo that already has a commit and origin set
+            repo_path = os.path.join(root, "preconfigured")
+            os.makedirs(repo_path)
+            git(["init", "-q", "-b", "main"], repo_path)
+            with open(os.path.join(repo_path, "README.md"), "w") as f:
+                f.write("# pre\n")
+            git(["add", "-A"], repo_path)
+            git(["-c", "user.email=t@t.io", "-c", "user.name=t",
+                 "commit", "-qm", "init"], repo_path)
+            git(["remote", "add", "origin", bare], repo_path)
+            os.environ["AGENTSYNC_REPO"] = repo_path
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
-        r = json.loads(M.provision(repo=slug))
-        assert r["status"] == "provisioned", r
-        assert record["created"] == [], "must not create when remote exists"
-        assert any("remote already configured" in s for s in r["steps"]), r["steps"]
-        ls = git(["ls-tree", "-r", "--name-only", "agentsync"], bare).stdout
-        assert "claims.json" in ls, ls
+            r = json.loads(M.provision(repo=slug))
+            assert r["status"] == "provisioned", r
+            assert record["created"] == [], "must not create when remote exists"
+            assert any("remote already configured" in s for s in r["steps"]), \
+                r["steps"]
+            ls = git(["ls-tree", "-r", "--name-only", "agentsync"], bare).stdout
+            assert "claims.json" in ls, ls
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -449,10 +507,8 @@ def test_provision_skips_when_remote_already_configured():
 def test_provision_reports_invite_failure():
     root = tempfile.mkdtemp(prefix="agentsync_prov_")
     try:
-        install_gh_stub(root)
-        # override only the collaborator PUT to fail
-        real_login = M._gh_login
         remotes = os.path.join(root, "remotes")
+        os.makedirs(remotes, exist_ok=True)
 
         def bare_for(slug):
             return os.path.join(remotes, slug.replace("/", "__") + ".git")
@@ -469,18 +525,20 @@ def test_provision_reports_invite_failure():
                                        stderr="HTTP 404: user not found")
             raise AssertionError(f"unexpected gh call: {args}")
 
-        M._gh = fake_gh
-        repo_path = os.path.join(root, "failinvite")
-        os.environ["AGENTSYNC_REPO"] = repo_path
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+        with patched(_gh=fake_gh, _gh_login=lambda: "tester",
+                     _gh_repo_exists=lambda slug: os.path.isdir(bare_for(slug))):
+            repo_path = os.path.join(root, "failinvite")
+            os.environ["AGENTSYNC_REPO"] = repo_path
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
-        r = json.loads(M.provision(repo="tester/failinvite",
-                                   partner_github="ghost"))
-        # provisioning still succeeds; the invite failure is reported, not fatal
-        assert r["status"] == "provisioned", r
-        assert r["partner_invited"] is False, r
-        assert any("could not invite" in s for s in r["steps"]), r["steps"]
+            r = json.loads(M.provision(repo="tester/failinvite",
+                                       partner_github="ghost"))
+            # provisioning still succeeds; the invite failure is reported, not fatal
+            assert r["status"] == "provisioned", r
+            assert r["partner_invited"] is False, r
+            assert any("could not invite" in s for s in r["steps"]), r["steps"]
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -502,21 +560,22 @@ def test_add_collaborator():
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected gh call: {args}")
 
-        M._gh = fake_gh
-        os.environ["AGENTSYNC_REPO"] = repo
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+        with patched(_gh=fake_gh):
+            os.environ["AGENTSYNC_REPO"] = repo
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
-        r = json.loads(M.add_collaborator("jarmstrong158"))
-        assert r["status"] == "invited", r
-        assert r["repo"] == "tester/proj", r
-        assert r["permission"] == "push", r
-        assert "jarmstrong158" in invites, invites
-        assert r["clone_url"] == "https://github.com/tester/proj.git", r
+            r = json.loads(M.add_collaborator("jarmstrong158"))
+            assert r["status"] == "invited", r
+            assert r["repo"] == "tester/proj", r
+            assert r["permission"] == "push", r
+            assert "jarmstrong158" in invites, invites
+            assert r["clone_url"] == "https://github.com/tester/proj.git", r
 
-        # invalid permission is rejected before any gh call
-        r2 = json.loads(M.add_collaborator("x", permission="superuser"))
-        assert "error" in r2, r2
+            # invalid permission is rejected before any gh call
+            r2 = json.loads(M.add_collaborator("x", permission="superuser"))
+            assert "error" in r2, r2
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -533,12 +592,27 @@ def test_add_collaborator_no_remote():
                 return SimpleNamespace(returncode=1, stdout="", stderr="no repo")
             raise AssertionError(f"unexpected gh call: {args}")
 
-        M._gh = fake_gh
-        os.environ["AGENTSYNC_REPO"] = repo
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+        with patched(_gh=fake_gh):
+            os.environ["AGENTSYNC_REPO"] = repo
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
 
-        r = json.loads(M.add_collaborator("jarmstrong158"))
-        assert "error" in r, r
+            r = json.loads(M.add_collaborator("jarmstrong158"))
+            assert "error" in r, r
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_gh_stubs_are_uninstalled_after_use():
+    """Guards the leak itself: the fake gh must not survive the test that
+    installed it, or the suite passes only by list ordering."""
+    real_gh, real_login = M._gh, M._gh_login
+    root = tempfile.mkdtemp(prefix="agentsync_leak_")
+    try:
+        with gh_stub(root) as (_record, _bare_for):
+            assert M._gh is not real_gh, "stub was not installed"
+        assert M._gh is real_gh, "gh stub leaked out of its context"
+        assert M._gh_login is real_login, "gh_login stub leaked"
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -621,22 +695,68 @@ def test_survey_flags_stale_claim():
         assert s["partners"]["sleepy"]["age_hours"] > 24, s
 
 
-def test_duplicate_agent_id_warns():
+def _foreign_instance_claim(root, origin, clones, status="in-progress"):
+    """Put a claim under "jonny" stamped by a *different* server instance."""
+    be(clones, "jonny")
+    M.survey()
+    scratch = os.path.join(root, "scratch")
+    git(["clone", "-q", origin, scratch], root)
+    peer_push_claim(scratch, "agentsync", "jonny", {
+        "task": "someone-elses", "touches": ["z.py"], "requires": [],
+        "branch": "other/z", "status": status,
+        "updated_at": M._now(), "instance": "deadbeef", "note": None,
+    })
+    be(clones, "jonny")
+
+
+def test_duplicate_agent_id_blocks_instead_of_clobbering():
+    """One id holds one claim, so claiming over a live one erases it. Refuse.
+
+    The overlap loop skips our own id, so the erased claim's files lose their
+    protection with nothing reporting it -- the failure four agents hit.
+    """
     with lab() as (root, origin, clones):
-        be(clones, "jonny")
-        M.survey()
-        scratch = os.path.join(root, "scratch")
-        git(["clone", "-q", origin, scratch], root)
-        # an entry under "jonny" written by a *different* instance
-        peer_push_claim(scratch, "agentsync", "jonny", {
-            "task": "someone-elses", "touches": ["z.py"], "requires": [],
-            "branch": "other/z", "status": "in-progress",
-            "updated_at": M._now(), "instance": "deadbeef", "note": None,
-        })
-        be(clones, "jonny")
+        _foreign_instance_claim(root, origin, clones)
+        r = json.loads(M.claim("mine", ["a.py"], branch="jonny/a"))
+        assert r["status"] == "blocked", r
+        block = r["conflicts"]["jonny"]
+        assert block["their_task"] == "someone-elses", r
+        reason = block["reasons"][0]
+        assert reason["type"] == "shared_agent_id", r
+        assert reason["files"] == ["z.py"], r  # names what would be lost
+        assert "force=True" in r["message"], r
+        # and the prior claim is untouched on the board
+        assert json.loads(M.survey())["partners"] == {}, "own id is not a peer"
+
+
+def test_duplicate_agent_id_force_still_wins():
+    """DESIGN: advisory, not enforced -- a restarted server reclaims its slot."""
+    with lab() as (root, origin, clones):
+        _foreign_instance_claim(root, origin, clones)
+        r = json.loads(M.claim("mine", ["a.py"], branch="jonny/a", force=True))
+        assert r["status"] == "claimed", r
+        assert "z.py" in r["warning"], r  # says what stopped being protected
+        assert "unique" in r["warning"].lower(), r
+
+
+def test_duplicate_agent_id_ignores_finished_claim():
+    """A 'done' claim holds nothing, so re-claiming the slot is not a clobber."""
+    with lab() as (root, origin, clones):
+        _foreign_instance_claim(root, origin, clones, status="done")
         r = json.loads(M.claim("mine", ["a.py"], branch="jonny/a"))
         assert r["status"] == "claimed", r
-        assert "warning" in r and "unique" in r["warning"].lower(), r
+        assert "warning" not in r, r
+
+
+def test_same_instance_reclaim_is_not_a_collision():
+    """'One unit of work = one claim. Re-claim for the next unit.' (AGENTS.md)"""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        first = json.loads(M.claim("unit one", ["a.py"], branch="jonny/a"))
+        assert first["status"] == "claimed", first
+        second = json.loads(M.claim("unit two", ["b.py"], branch="jonny/a"))
+        assert second["status"] == "claimed", second
+        assert "warning" not in second, second
 
 
 # --------------------------------------------------------------------------- #
@@ -659,15 +779,16 @@ def test_add_multiple_collaborators():
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected gh call: {args}")
 
-        M._gh = fake_gh
-        os.environ["AGENTSYNC_REPO"] = repo
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+        with patched(_gh=fake_gh):
+            os.environ["AGENTSYNC_REPO"] = repo
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
-        r = json.loads(M.add_collaborator("alice, bob carol"))
-        assert r["status"] == "invited", r
-        assert len(r["results"]) == 3, r
-        assert set(invites) == {"alice", "bob", "carol"}, invites
+            r = json.loads(M.add_collaborator("alice, bob carol"))
+            assert r["status"] == "invited", r
+            assert len(r["results"]) == 3, r
+            assert set(invites) == {"alice", "bob", "carol"}, invites
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -675,18 +796,19 @@ def test_add_multiple_collaborators():
 def test_provision_invites_multiple_partners():
     root = tempfile.mkdtemp(prefix="agentsync_prov_")
     try:
-        record, bare_for = install_gh_stub(root)
-        repo_path = os.path.join(root, "team-project")
-        os.environ["AGENTSYNC_REPO"] = repo_path
-        os.environ["AGENTSYNC_AGENT_ID"] = "tester"
-        os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
+        with gh_stub(root) as (record, _bare_for):
+            repo_path = os.path.join(root, "team-project")
+            os.environ["AGENTSYNC_REPO"] = repo_path
+            os.environ["AGENTSYNC_AGENT_ID"] = "tester"
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+            os.environ.pop("AGENTSYNC_PARTNER_GITHUB", None)
 
-        r = json.loads(M.provision(repo="tester/team-project",
-                                   partner_github="alice bob"))
-        assert r["status"] == "provisioned", r
-        assert r["partner_invited"] is True, r
-        assert len(r["partners_invited"]) == 2, r
-        assert set(record["invites"]) == {"alice", "bob"}, record
+            r = json.loads(M.provision(repo="tester/team-project",
+                                       partner_github="alice bob"))
+            assert r["status"] == "provisioned", r
+            assert r["partner_invited"] is True, r
+            assert len(r["partners_invited"]) == 2, r
+            assert set(record["invites"]) == {"alice", "bob"}, record
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -727,6 +849,15 @@ def test_done_captures_changed_files():
         cf = r["claim"]["changed_files"]
         assert cf and any(c["path"] == "auth.py" for c in cf), r
         assert cf[0]["status"] == "A", r  # added file
+        # A claim records a branch NAME only. Where the board repo is not the
+        # work repo, a same-named branch there diffs cleanly and yields a
+        # confidently wrong list, so the diffstat says which repo it came from.
+        slug = r["claim"]["changed_files_repo"]
+        assert isinstance(slug, str) and slug, r
+        assert "\\" not in slug and not slug.endswith(".git"), slug
+        want = os.path.basename(origin)
+        want = want[:-4] if want.endswith(".git") else want
+        assert slug.split("/")[-1] == want, (slug, origin)
 
 
 def test_finish_opens_pr_and_marks_done():
@@ -817,22 +948,144 @@ def test_history_survives_smart_quote_in_subject():
         assert mine["task"] == task, mine
 
 
-def test_xylem_session_pointer_followed_when_repo_unpinned():
-    """With AGENTSYNC_REPO unpinned, _cfg follows the project the Xylem
-    SessionStart hook recorded in the shared pointer (agent id still from env)."""
+def corrupt_the_board(root, origin, text, branch="agentsync"):
+    """Land arbitrary bytes as claims.json on the coordination branch, as if a
+    half-finished write or a bad merge had corrupted the board. Uses a scratch
+    clone of its own so it never fights an agent clone's agentsync worktree."""
+    scratch = tempfile.mkdtemp(prefix="agentsync_corrupt_", dir=root)
+    wc = os.path.join(scratch, "wc")
+    git(["clone", "-q", "-b", branch, origin, wc], scratch)
+    with open(os.path.join(wc, "claims.json"), "w", encoding="utf-8") as f:
+        f.write(text)
+    git(["add", "claims.json"], wc)
+    git(["commit", "-qm", "corrupt claims"], wc)
+    git(["push", "-q", "origin", branch], wc)
+
+
+def remote_claims_blob(origin, branch="agentsync"):
+    """claims.json exactly as it stands on the shared remote."""
+    return git(["--git-dir", origin, "show", f"{branch}:claims.json"], None).stdout
+
+
+def test_corrupt_claims_fails_closed_and_spares_peer_claims():
+    """A corrupt claims.json used to read as {"claims": {}} — 'nobody holds
+    anything' — and the next claim() wrote a file containing ONLY this agent's
+    entry and pushed it, wiping every peer. Reads must now fail closed, and the
+    board on the remote must be left exactly as it was found."""
     with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("auth", ["auth.py"], branch="jonny/auth")   # a real peer claim
+        corrupt = '{"claims": {"jonny": {"task": "auth",'    # truncated mid-write
+        corrupt_the_board(root, origin, corrupt)
+        before = remote_claims_blob(origin)
+        assert "jonny" in before, before
+
+        be(clones, "partner")
+        try:
+            M.survey()
+            assert False, "survey() must not read a corrupt board as empty"
+        except M.ClaimsCorrupt as e:
+            assert "claims.json" in str(e), e
+            assert "peer" in str(e), e   # explains WHY it refuses
+
+        try:
+            M.claim("db", ["db.py"], branch="partner/db")
+            assert False, "claim() must refuse to write over a corrupt board"
+        except M.ClaimsCorrupt:
+            pass
+
+        after = remote_claims_blob(origin)
+        assert after == before, "claim() overwrote a corrupt board:\n%r" % after
+
+
+def test_corrupt_claims_wrong_toplevel_type_fails_closed():
+    """Valid JSON of the wrong shape is corruption too — a list would have
+    .setdefault-crashed or silently yielded an empty board."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("auth", ["auth.py"], branch="jonny/auth")
+        corrupt_the_board(root, origin, '["not", "an", "object"]')
+        be(clones, "partner")
+        try:
+            M.survey()
+            assert False, "expected ClaimsCorrupt for a non-object claims.json"
+        except M.ClaimsCorrupt as e:
+            assert "not a JSON object" in str(e), e
+
+
+def test_missing_claims_file_is_still_an_empty_board():
+    """Fail-closed must not mean fail-always: an ABSENT file legitimately means
+    a board nobody has written to yet."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        cfg = M._cfg()
+        assert M._read_claims(cfg) == {"claims": {}}, "absent != corrupt"
+
+
+@contextlib.contextmanager
+def session_pointer(root, project):
+    """Point the shared Xylem session pointer at `project` for the block."""
+    ptr = os.path.join(root, "active_project.json")
+    with open(ptr, "w", encoding="utf-8") as f:
+        json.dump({"project": project}, f)
+    os.environ["XYLEM_ACTIVE_PROJECT_FILE"] = ptr
+    try:
+        yield ptr
+    finally:
+        os.environ.pop("XYLEM_ACTIVE_PROJECT_FILE", None)
+
+
+def test_session_repo_followed_only_when_it_holds_a_board():
+    """Unpinned, _cfg falls back to the session's project — but ONLY because
+    that clone actually holds the coordination branch. The fallback is
+    self-validating, not a blind follow of the session pointer."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("seed the board", ["seed.py"], branch="jonny/seed")  # creates it
         os.environ.pop("AGENTSYNC_REPO", None)
         os.environ["AGENTSYNC_AGENT_ID"] = "jonny"
-        ptr = os.path.join(root, "active_project.json")
-        with open(ptr, "w", encoding="utf-8") as f:
-            json.dump({"project": clones["jonny"]}, f)
-        os.environ["XYLEM_ACTIVE_PROJECT_FILE"] = ptr
-        try:
+        with session_pointer(root, clones["jonny"]):
             cfg = M._cfg()
             assert cfg["repo"] == os.path.abspath(clones["jonny"]), cfg
             assert cfg["agent"] == "jonny", cfg
+            assert cfg["board_source"] == "current-repo", cfg
+
+
+def test_session_repo_without_a_board_is_refused_not_silently_used():
+    """THE HEADLINE BUG. A session project with no coordination branch used to
+    be accepted, and every read then reported 'no board' forever. It must now
+    fail loudly with the setting to fix it."""
+    with lab() as (root, origin, clones):
+        os.environ.pop("AGENTSYNC_REPO", None)
+        os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+        os.environ["AGENTSYNC_AGENT_ID"] = "jonny"
+        with session_pointer(root, clones["jonny"]):   # never provisioned
+            try:
+                M._cfg()
+                assert False, "expected ConfigError for a boardless session repo"
+            except M.ConfigError as e:
+                assert "AGENTSYNC_BOARD_REPO" in str(e), e
+                assert "coordination branch" in str(e), e
+
+
+def test_board_repo_env_wins_over_session_pointer():
+    """AGENTSYNC_BOARD_REPO is session-independent by construction: the pointer
+    may say anything, the board address does not move."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("seed the board", ["seed.py"], branch="jonny/seed")
+        os.environ.pop("AGENTSYNC_REPO", None)
+        os.environ["AGENTSYNC_BOARD_REPO"] = clones["jonny"]
+        os.environ["AGENTSYNC_AGENT_ID"] = "partner"
+        try:
+            with session_pointer(root, clones["partner"]):
+                cfg = M._cfg()
+                assert cfg["repo"] == os.path.abspath(clones["jonny"]), cfg
+                assert cfg["board_source"] == "AGENTSYNC_BOARD_REPO", cfg
+            # and the board is visible from it
+            assert M.repo_has_board(cfg["repo"], "origin", "agentsync")
         finally:
-            os.environ.pop("XYLEM_ACTIVE_PROJECT_FILE", None)
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
 
 
 # --------------------------------------------------------------------------- #
@@ -850,6 +1103,8 @@ TESTS = [
     test_textual_conflict_detected,
     test_no_textual_conflict_when_disjoint,
     test_check_conflicts_partner_branch_not_pushed,
+    test_check_conflicts_against_branch_reports_real_overlap,
+    test_check_conflicts_against_unclaimed_branch_is_unknown_not_clear,
     test_cas_peer_entry_survives_retry,
     test_cas_colliding_peer_blocks_on_retry,
     test_gh_missing_friendly_error,
@@ -859,13 +1114,17 @@ TESTS = [
     test_provision_reports_invite_failure,
     test_add_collaborator,
     test_add_collaborator_no_remote,
+    test_gh_stubs_are_uninstalled_after_use,
     test_block_on_directory_containment,
     test_block_on_glob,
     test_path_normalization_overlap,
     test_disjoint_directories_are_clean,
     test_release_frees_the_file,
     test_survey_flags_stale_claim,
-    test_duplicate_agent_id_warns,
+    test_duplicate_agent_id_blocks_instead_of_clobbering,
+    test_duplicate_agent_id_force_still_wins,
+    test_duplicate_agent_id_ignores_finished_claim,
+    test_same_instance_reclaim_is_not_a_collision,
     test_add_multiple_collaborators,
     test_provision_invites_multiple_partners,
     test_history_timeline,
@@ -874,7 +1133,12 @@ TESTS = [
     test_finish_returns_existing_pr_url,
     test_finish_requires_pushed_branch,
     test_history_survives_smart_quote_in_subject,
-    test_xylem_session_pointer_followed_when_repo_unpinned,
+    test_corrupt_claims_fails_closed_and_spares_peer_claims,
+    test_corrupt_claims_wrong_toplevel_type_fails_closed,
+    test_missing_claims_file_is_still_an_empty_board,
+    test_session_repo_followed_only_when_it_holds_a_board,
+    test_session_repo_without_a_board_is_refused_not_silently_used,
+    test_board_repo_env_wins_over_session_pointer,
 ]
 
 

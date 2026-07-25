@@ -30,12 +30,30 @@ survey/claim protocol takes over.
 
 Config (environment, set in the MCP client config)
 --------------------------------------------------
-    AGENTSYNC_REPO      absolute path to the local clone        (required)
+    AGENTSYNC_BOARD_REPO  absolute path to the clone that HOLDS THE BOARD.
+                          The board is a shared, long-lived team artifact, so
+                          this address is deliberately session-independent: it
+                          never follows the Xylem session pointer.
+    AGENTSYNC_REPO      legacy alias for the board address       (equivalent)
     AGENTSYNC_AGENT_ID  this agent's id, e.g. "jonny"           (required)
     AGENTSYNC_REMOTE    remote name                             (default: origin)
     AGENTSYNC_BRANCH    coordination branch                     (default: agentsync)
     AGENTSYNC_PARTNER_GITHUB  partner's GitHub username, invited
                               as a collaborator by provision()   (optional)
+
+Board resolution order (see _resolve_board_repo):
+    1. AGENTSYNC_BOARD_REPO  — the explicit board address.
+    2. AGENTSYNC_REPO        — the legacy explicit pin, same effect.
+    3. the session's / current repo, but ONLY if it actually holds the
+       coordination branch (a self-validating fallback).
+    4. a clear ConfigError naming the setting to set.
+
+Rationale: before this order existed, an unpinned server followed
+~/.xylem/active_project.json, so the board silently changed identity whenever
+the session changed project — and simply vanished (reported as "no coordination
+branch found") in any project that had never been provisioned. cambium's
+distill() applies this exact same order, so the two halves of the suite can
+never disagree about where the board is.
 """
 
 import contextlib
@@ -85,8 +103,9 @@ def _log(msg):
     logging failure must never break a tool call. This is the breadcrumb trail
     that turns 'it hangs' into 'it hung on exactly this git command'."""
     try:
-        repo = os.environ.get("AGENTSYNC_REPO")
-        if not repo:
+        repo = os.environ.get("AGENTSYNC_BOARD_REPO") or os.environ.get(
+            "AGENTSYNC_REPO")
+        if not repo or not os.path.isdir(os.path.join(repo, ".git")):
             return
         line = f"{datetime.now(timezone.utc).isoformat()} {msg}\n"
         with open(os.path.join(repo, ".git", "agentsync.log"), "a", encoding="utf-8") as f:
@@ -122,17 +141,88 @@ def _xylem_session_project():
     return proj if isinstance(proj, str) and os.path.isdir(proj) else None
 
 
-def _cfg(require_git=True):
-    # AGENTSYNC_REPO (explicit pin) wins; otherwise follow the session's project
-    # recorded by the Xylem SessionStart hook, so one global config coordinates
-    # whichever repo the session is in instead of a frozen install-time path.
-    repo = os.environ.get("AGENTSYNC_REPO") or _xylem_session_project()
-    agent = os.environ.get("AGENTSYNC_AGENT_ID")
-    if not repo or not agent:
+def _git_root(start=None):
+    """The git working-tree root at or above `start` (default: cwd), or ""."""
+    d = os.path.abspath(start or os.getcwd())
+    while d:
+        if os.path.isdir(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return ""
+        d = parent
+    return ""
+
+
+def repo_has_board(repo, remote="origin", branch="agentsync"):
+    """True if `repo` actually holds the coordination branch — as a local head,
+    a remote-tracking ref, or on the remote itself. Cheap local ref checks run
+    first; the network ls-remote is a last resort (and bounded by GIT_TIMEOUT).
+
+    This is what makes the "current repo" fallback self-validating: it can only
+    ever select a repo that IS a board, never one that merely happens to be the
+    project this session opened in."""
+    if not repo or not os.path.isdir(os.path.join(repo, ".git")):
+        return False
+    for ref in (f"refs/heads/{branch}", f"refs/remotes/{remote}/{branch}"):
+        p = _git(["rev-parse", "--verify", "--quiet", ref], repo, check=False)
+        if p.returncode == 0 and p.stdout.strip():
+            return True
+    try:
+        p = _git(["ls-remote", "--heads", remote, branch], repo, check=False)
+    except RuntimeError:
+        return False          # timed out / unreachable remote — not a board here
+    return p.returncode == 0 and bool(p.stdout.strip())
+
+
+def _resolve_board_repo(remote="origin", branch="agentsync", require_git=True):
+    """Resolve WHERE THE BOARD LIVES, independently of the session pointer.
+
+    Returns (abs_path, source) where source is one of "AGENTSYNC_BOARD_REPO",
+    "AGENTSYNC_REPO" or "current-repo". Raises ConfigError with an actionable
+    message rather than silently selecting a repo that holds no board.
+
+    cambium._resolve_board_repo mirrors this order exactly; if you change one,
+    change both."""
+    for name in ("AGENTSYNC_BOARD_REPO", "AGENTSYNC_REPO"):
+        v = os.environ.get(name)
+        if v:
+            return os.path.abspath(os.path.expanduser(v)), name
+
+    candidate = _xylem_session_project() or _git_root()
+    if candidate and require_git:
+        cand = os.path.abspath(candidate)
+        if repo_has_board(cand, remote, branch):
+            return cand, "current-repo"
         raise ConfigError(
-            "AGENTSYNC_REPO and AGENTSYNC_AGENT_ID must be set in the MCP config."
+            "No agentsync board found. AGENTSYNC_BOARD_REPO is not set, and the "
+            f"current project ({cand}) has no '{branch}' coordination branch on "
+            f"'{remote}'. The board is a shared, long-lived artifact — it does "
+            "NOT follow whichever project this session happens to be in. Either "
+            "set AGENTSYNC_BOARD_REPO to the absolute path of the clone that "
+            "holds the board, or call provision() to create one here."
         )
-    repo = os.path.abspath(repo)
+    if candidate:
+        return os.path.abspath(candidate), "current-repo"
+    raise ConfigError(
+        "AGENTSYNC_BOARD_REPO must be set in the MCP config — the absolute path "
+        "to the clone holding the coordination branch. (AGENTSYNC_REPO is "
+        "accepted as a legacy alias.)"
+    )
+
+
+def _cfg(require_git=True):
+    agent = os.environ.get("AGENTSYNC_AGENT_ID")
+    if not agent:
+        raise ConfigError(
+            "AGENTSYNC_AGENT_ID must be set in the MCP config."
+        )
+    remote = os.environ.get("AGENTSYNC_REMOTE", "origin")
+    branch = os.environ.get("AGENTSYNC_BRANCH", "agentsync")
+    # The board address is deliberately session-independent — see
+    # _resolve_board_repo. An unpinned server used to follow the Xylem session
+    # pointer blindly, which is how the board went missing for months.
+    repo, board_source = _resolve_board_repo(remote, branch, require_git)
     if require_git and not os.path.isdir(os.path.join(repo, ".git")):
         raise ConfigError(
             f"{repo} is not a git repository (no .git directory). "
@@ -140,9 +230,10 @@ def _cfg(require_git=True):
         )
     return {
         "repo": repo,
+        "board_source": board_source,
         "agent": agent,
-        "remote": os.environ.get("AGENTSYNC_REMOTE", "origin"),
-        "branch": os.environ.get("AGENTSYNC_BRANCH", "agentsync"),
+        "remote": remote,
+        "branch": branch,
         "partner_github": os.environ.get("AGENTSYNC_PARTNER_GITHUB", ""),
         "worktree": os.path.join(repo, ".git", "agentsync-wt"),
     }
@@ -230,6 +321,27 @@ def _default_remote_head(cfg):
     return f"{cfg['remote']}/main"
 
 
+def _origin_slug(cfg):
+    """'owner/name' behind cfg's remote, for labelling which repo a diffstat
+    came from. Reads git config rather than `gh` (cf. _repo_slug) so annotating
+    a finished claim never depends on the GitHub CLI being present or online."""
+    p = _git(["remote", "get-url", cfg["remote"]], cfg["repo"], check=False)
+    url = (p.stdout or "").strip() or cfg["repo"]
+    if url.endswith(".git"):
+        url = url[:-4]
+    if "://" in url:                                  # scheme://host/owner/name
+        tail = url.split("://", 1)[1].split("/")[1:]
+    elif "@" in url.split(":", 1)[0] and ":" in url:  # git@host:owner/name
+        tail = url.split(":", 1)[1].split("/")
+    else:
+        # A filesystem path: a local board, or a test fixture. There is no
+        # owner/name to report, so name the directory rather than mangling
+        # a Windows drive letter into something that looks like a slug.
+        return os.path.basename(url.rstrip("/\\"))
+    tail = [s for s in tail if s]
+    return "/".join(tail[-2:]) if tail else url
+
+
 def _branch_changes(cfg, branch):
     """The files a claimed branch changed vs the default branch (three-dot, so
     only this branch's own work). Returns a list of {status, path}, or None if
@@ -302,7 +414,19 @@ def _write_claims_atomic(path, data):
         raise
 
 
+class ClaimsCorrupt(RuntimeError):
+    """claims.json exists but cannot be trusted. Raised, never swallowed."""
+
+
 def _read_claims(cfg):
+    """The board's live state, or ClaimsCorrupt.
+
+    FAIL CLOSED. An unreadable claims.json used to degrade to {"claims": {}} —
+    "nobody holds anything" — and the very next claim() then wrote a file
+    containing only this agent's entry and pushed it, silently destroying every
+    peer's claim. An absent file legitimately means an empty board; a present
+    but unparseable one means we do not know what the board says, and mutual
+    exclusion cannot be guaranteed from a guess."""
     path = os.path.join(cfg["worktree"], CLAIMS_FILE)
     if not os.path.exists(path):
         return {"claims": {}}
@@ -310,11 +434,31 @@ def _read_claims(cfg):
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
-        # Contract preserved (treat as no claims), but make the failure visible —
-        # a corrupt claims.json should not silently read as "nobody holds anything".
-        _log(f"WARNING: could not parse {path}: {e!r} — treating as empty")
-        data = {"claims": {}}
-    data.setdefault("claims", {})
+        _log(f"CORRUPT {path}: {e!r} — refusing to treat as an empty board")
+        raise ClaimsCorrupt(
+            f"{CLAIMS_FILE} on the '{cfg['branch']}' branch could not be read "
+            f"({e.__class__.__name__}: {e}). Refusing to continue: treating a "
+            "corrupt board as empty would let the next claim overwrite every "
+            f"peer's entry. The file is at {path}. Recover it with "
+            f"`git -C \"{cfg['repo']}\" checkout {cfg['remote']}/{cfg['branch']}"
+            f" -- {CLAIMS_FILE}` in that worktree, or repair the JSON by hand, "
+            "then retry."
+        ) from e
+    if not isinstance(data, dict):
+        _log(f"CORRUPT {path}: top level is {type(data).__name__}, not an object")
+        raise ClaimsCorrupt(
+            f"{CLAIMS_FILE} on the '{cfg['branch']}' branch is a "
+            f"{type(data).__name__}, not a JSON object. Refusing to continue — "
+            "see the recovery note in _read_claims. File: " + path
+        )
+    claims = data.setdefault("claims", {})
+    if not isinstance(claims, dict):
+        _log(f"CORRUPT {path}: 'claims' is {type(claims).__name__}, not an object")
+        raise ClaimsCorrupt(
+            f"{CLAIMS_FILE} on the '{cfg['branch']}' branch has a "
+            f"'claims' key of type {type(claims).__name__}, not an object. "
+            "Refusing to continue. File: " + path
+        )
     return data
 
 
@@ -440,6 +584,25 @@ def _match_files(mine, theirs):
                 hits.add(m)
                 hits.add(t)
     return sorted(hits)
+
+
+def _claim_owning_branch(claims, branch, me):
+    """(agent_id, claim) for the peer claim whose branch is `branch`, else
+    (None, None). Prefers an active claim over a finished one, so checking
+    against a branch that has been claimed twice reports the live intent."""
+    want = (branch or "").strip()
+    if not want:
+        return None, None
+    finished = None
+    for pid, c in claims.items():
+        if pid == me or not isinstance(c, dict):
+            continue
+        if (c.get("branch") or "").strip() != want:
+            continue
+        if c.get("status") != "done":
+            return pid, c
+        finished = finished or (pid, c)
+    return finished if finished else (None, None)
 
 
 def _overlap(my_touches, my_requires, peer):
@@ -703,6 +866,10 @@ def survey() -> str:
         {
             "me": cfg["agent"],
             "branch": cfg["branch"],
+            # Which board this is, and how it was addressed. Without this a
+            # survey of the WRONG (or an empty, freshly auto-created) board is
+            # indistinguishable from a survey of a quiet team.
+            "board": {"repo": cfg["repo"], "source": cfg["board_source"]},
             "partners": others,
             "stale_claims": stale,
         },
@@ -736,17 +903,61 @@ def claim(
         data = _read_claims(cfg)
         claims = data["claims"]
 
-        # duplicate-id guard: our id already holds an active claim stamped by a
-        # *different* server process -> likely two people sharing one agent id.
+        # duplicate-id guard: our id already holds an in-progress claim stamped
+        # by a *different* server process. claims.json holds exactly one claim
+        # per agent id, so writing now erases that claim outright and there is
+        # nothing left to recover it from -- and because the overlap loop below
+        # skips our own id, the files it was holding lose their protection
+        # silently. Refuse by default. `force` still wins, so a restarted server
+        # reclaiming its own slot is one call away, per DESIGN "advisory, not
+        # enforced" -- what changes is that the destructive path is now chosen,
+        # not stumbled into.
         prior = claims.get(cfg["agent"])
+        shared_id = bool(
+            prior
+            and prior.get("instance")
+            and prior.get("instance") != INSTANCE
+            and prior.get("status") == "in-progress"
+        )
+
+        if shared_id and not force:
+            return json.dumps(
+                {
+                    "status": "blocked",
+                    "message": (
+                        f"Agent id '{cfg['agent']}' already holds an in-progress "
+                        "claim written by a different agentsync instance, and "
+                        "one id holds exactly one claim -- claiming now would "
+                        "erase it. If another agent is live under this id, give "
+                        "each one its own AGENTSYNC_AGENT_ID. If that session is "
+                        "gone (a restarted server reclaiming its own slot), "
+                        "re-call with force=True."
+                    ),
+                    "conflicts": {
+                        cfg["agent"]: {
+                            "their_task": prior.get("task"),
+                            "their_branch": prior.get("branch"),
+                            "reasons": [
+                                {
+                                    "type": "shared_agent_id",
+                                    "files": list(prior.get("touches", [])),
+                                    "held_since": prior.get("updated_at"),
+                                }
+                            ],
+                        }
+                    },
+                },
+                indent=2,
+            )
+
         dup_warn = None
-        if (prior and prior.get("instance") and prior.get("instance") != INSTANCE
-                and prior.get("status") == "in-progress"):
+        if shared_id:  # reached only with force=True
+            lost = ", ".join(prior.get("touches", [])) or "(none declared)"
             dup_warn = (
-                f"Agent id '{cfg['agent']}' already holds an in-progress claim "
-                "written by a different agentsync instance. If a teammate is "
-                "using the same AGENTSYNC_AGENT_ID, give each person a unique id "
-                "— otherwise you overwrite each other's claims."
+                f"Forced past an in-progress claim held by another instance of "
+                f"agent id '{cfg['agent']}'. That claim is gone and these files "
+                f"are no longer protected: {lost}. Give each concurrent agent a "
+                "unique AGENTSYNC_AGENT_ID."
             )
 
         if not force:
@@ -805,7 +1016,12 @@ def check_conflicts(against_branch: str = "") -> str:
 
     against_branch lets you check one specific branch; default checks every
     branch named in a peer's active claim. Your own branch is taken from your
-    current claim."""
+    current claim.
+
+    claim_overlap is intent-level, so it only exists where intent was declared.
+    If against_branch names a branch no active claim mentions, claim_overlap is
+    reported as an explicit {"status": "unknown"} object naming the reason —
+    never as an empty list, which would read as a verified all-clear."""
     cfg = _cfg()
     _ensure_worktree(cfg)
     claims = _read_claims(cfg)["claims"]
@@ -818,7 +1034,14 @@ def check_conflicts(against_branch: str = "") -> str:
     my_touches = set(mine.get("touches", []))
 
     if against_branch:
-        targets = [(None, against_branch, set())]
+        # Read the touches off whichever claim actually owns that branch. This
+        # used to be a hardcoded set(), so claim_overlap was ALWAYS empty and
+        # an explicitly targeted check reported "no conflict" unconditionally.
+        owner, peer = _claim_owning_branch(claims, against_branch, cfg["agent"])
+        if peer is None:
+            targets = [(None, against_branch, None)]   # intent unknowable
+        else:
+            targets = [(owner, against_branch, set(peer.get("touches", [])))]
     else:
         targets = [
             (pid, p["branch"], set(p.get("touches", [])))
@@ -832,7 +1055,18 @@ def check_conflicts(against_branch: str = "") -> str:
     _git(["fetch", remote, "--prune"], repo, check=False)
     results = []
     for pid, br, their_touches in targets:
-        overlap = _match_files(my_touches, their_touches)
+        if their_touches is None:
+            overlap = {
+                "status": "unknown",
+                "reason": f"no active claim on this board names branch '{br}', "
+                          "so its declared touches are unknown — the "
+                          "intent-level check cannot run. The merge_conflict "
+                          "result below is still authoritative (it is textual).",
+                "fix": "ask that agent to claim(...) with branch=%r, or drop "
+                       "against_branch to check every claimed branch." % br,
+            }
+        else:
+            overlap = _match_files(my_touches, their_touches)
         # resolve refs (prefer remote-tracking) and dry-run merge
         ref_mine = f"{remote}/{my_branch}"
         ref_their = f"{remote}/{br}"
@@ -939,6 +1173,14 @@ def _set_status(cfg, status, note):
                 done_changes = _branch_changes(cfg, mine["branch"])
                 computed = True
             mine["changed_files"] = done_changes
+            # Name the repo the diffstat came from. A claim records a branch
+            # NAME with no repo qualifier, so where the board repo is not the
+            # work repo, a same-named branch in the board repo diffs cleanly
+            # and yields a confidently wrong file list. Labelling it makes
+            # "these are my files" and "these are some other repo's files"
+            # distinguishable, the same way survey() reports board {repo,
+            # source} rather than letting a wrong board look like a quiet one.
+            mine["changed_files_repo"] = _origin_slug(cfg)
         _write_claims_atomic(os.path.join(cfg["worktree"], CLAIMS_FILE), data)
         if _commit_and_push(cfg, f"agentsync: {cfg['agent']} -> {status}"):
             return True, mine

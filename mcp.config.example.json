@@ -1,12 +1,12 @@
 {
-  "_comment": "Each collaborator adds this to their own MCP client config (e.g. Claude Desktop's claude_desktop_config.json). AGENTSYNC_AGENT_ID must be unique per person; AGENTSYNC_REPO points at that person's own local clone of the shared repo.",
+  "_comment": "Each collaborator adds this to their own MCP client config (e.g. Claude Desktop's claude_desktop_config.json). AGENTSYNC_AGENT_ID must be unique per person; AGENTSYNC_BOARD_REPO points at that person's own local clone of the repo that HOLDS THE BOARD. Set it explicitly: the board is a shared team artifact and must not follow the Xylem session pointer. If it is unset, agentsync will only fall back to the current repo when that repo actually holds the coordination branch, and errors otherwise.",
 
   "mcpServers": {
     "agentsync": {
       "command": "python3",
       "args": ["/abs/path/to/agentsync/agentsync_server.py"],
       "env": {
-        "AGENTSYNC_REPO": "/abs/path/to/your/clone-of-the-shared-repo",
+        "AGENTSYNC_BOARD_REPO": "/abs/path/to/your/clone-of-the-repo-holding-the-board",
         "AGENTSYNC_AGENT_ID": "jonny",
 
         "_optional": "defaults shown below; omit unless you need to change them",

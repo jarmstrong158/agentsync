@@ -144,12 +144,24 @@ modes erode that, each with a minimal countermeasure:
   (in-progress and older than `AGENTSYNC_STALE_HOURS`, default 24h), plus a
   top-level `stale_claims` list. The judgment call — nudge them, or `force` past
   it — stays with the agent; the server only makes the staleness visible.
-- **Shared agent id.** Two people who both set `AGENTSYNC_AGENT_ID="claude"`
-  write to the same key and clobber each other with no error. Each server process
-  stamps a random `instance` token on the claims it writes; `claim()` warns (non-
-  fatally) when the id it's about to take is already held in-progress by a
-  *different* instance. It's advisory, not a hard block, so a legitimate server
-  restart doesn't wedge you — it just points at the real fix: unique ids.
+- **Shared agent id.** `claims.json` holds exactly one claim per agent id, so two
+  agents sharing `AGENTSYNC_AGENT_ID="claude"` write to the same key. Each server
+  process stamps a random `instance` token on the claims it writes; `claim()`
+  **refuses** when the id it's about to take is already held *in-progress* by a
+  *different* instance, naming the task, branch and files that would be lost.
+  `force=True` overrides — a restarted server reclaiming its own slot is one call
+  away, so this is still advisory in the sense that matters. What changed is that
+  the destructive path is now chosen rather than stumbled into.
+
+  This was originally a non-fatal warning, on the assumption that a shared id
+  meant *two people* and the warning would route them to the real fix (unique
+  ids). The common case turned out to be **one person running several agents**,
+  where the warning arrived attached to a `status: "claimed"` result — i.e. after
+  the other agent's claim had already been erased, with nothing left to recover
+  it from. Worse, the overlap loop skips our own id, so the erased claim's files
+  lost their protection *silently*: a third agent would survey, see nothing
+  holding them, and edit. Four independent agents hit this before it was traced.
+  The real fix is still unique ids per agent, and the block says so.
 
 ## Conflict detection — two levels
 

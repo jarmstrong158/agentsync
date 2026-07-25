@@ -50,7 +50,7 @@ agent id and their own local clone. See `mcp.config.example.json`:
       "command": "python3",
       "args": ["/abs/path/to/agentsync_server.py"],
       "env": {
-        "AGENTSYNC_REPO": "/abs/path/to/your/clone",
+        "AGENTSYNC_BOARD_REPO": "/abs/path/to/the/clone/holding/the/board",
         "AGENTSYNC_AGENT_ID": "jonny"
       }
     }
@@ -60,7 +60,8 @@ agent id and their own local clone. See `mcp.config.example.json`:
 
 | env var                   | required | default     | meaning                                    |
 |---------------------------|----------|-------------|--------------------------------------------|
-| `AGENTSYNC_REPO`          | yes      | —           | path to your local clone                   |
+| `AGENTSYNC_BOARD_REPO`    | yes\*    | —           | path to the clone that **holds the board** |
+| `AGENTSYNC_REPO`          | no       | —           | legacy alias for `AGENTSYNC_BOARD_REPO`    |
 | `AGENTSYNC_AGENT_ID`      | yes      | —           | your unique agent id                       |
 | `AGENTSYNC_REMOTE`        | no       | `origin`    | git remote name                            |
 | `AGENTSYNC_BRANCH`        | no       | `agentsync` | coordination branch name                   |
@@ -69,13 +70,39 @@ agent id and their own local clone. See `mcp.config.example.json`:
 | `AGENTSYNC_GIT_TIMEOUT`   | no       | `25`        | seconds any single git/gh call may run before it fails fast |
 
 The `agentsync` branch is created automatically on the first `survey()` or
-`claim()` call — no manual setup.
+`claim()` call against an explicitly addressed board — no manual setup.
+
+### Where the board lives (board addressing)
+
+\* The board is a **shared, long-lived team artifact**, not a property of
+whichever repo you happen to be sitting in. So its address is resolved
+independently of the session, in this order:
+
+1. **`AGENTSYNC_BOARD_REPO`** — the explicit board address. This never follows
+   the Xylem session pointer (`~/.xylem/active_project.json`).
+2. **`AGENTSYNC_REPO`** — the legacy explicit pin; identical effect.
+3. **The current repo** (session pointer, else the cwd's git root) — but *only
+   if that repo actually holds the coordination branch*. The check is a real ref
+   lookup (local head → remote-tracking ref → `ls-remote`), so this fallback can
+   only ever select a repo that genuinely **is** a board.
+4. Otherwise a **`ConfigError` naming `AGENTSYNC_BOARD_REPO`** — never a silent
+   selection of a boardless repo.
+
+`survey()` reports the board it actually read under `board: {repo, source}`, so
+"the team is quiet" and "I am looking at the wrong board" are distinguishable.
+
+**Why this order.** Previously an unpinned server followed the session pointer
+blindly. The board therefore changed identity whenever the session changed
+project, and in any project that had never been provisioned it simply
+disappeared — reported downstream as `"no coordination branch found"` and
+treated as normal. cambium's `distill()` applies this **exact same** resolution,
+so the two halves of the suite can never disagree about where the board is.
 
 ## Starting from nothing (no repo yet)
 
 If the shared repo doesn't exist on GitHub yet, **one** person runs `provision()`
-once. Point `AGENTSYNC_REPO` at the folder you want the project in (it can be
-empty or not yet created) and call:
+once. Point `AGENTSYNC_BOARD_REPO` at the folder you want the project in (it can
+be empty or not yet created) and call:
 
 ```
 provision(repo="you/our-project", partner_github="their-username")
@@ -117,8 +144,14 @@ overlaps and with whom. **Overlap is path-aware**: exact match, directory
 containment (`src/api` vs `src/api/routes.py`), and globs (`src/**`, `*.py`) all
 collide, and paths are normalized first (`./auth.py` == `auth.py`). The overlap
 is checked against freshly-fetched state immediately before the push. Pass
-`force=True` to claim anyway (e.g. same large file, disjoint regions). If two
-people share an agent id, the result carries a `warning`.
+`force=True` to claim anyway (e.g. same large file, disjoint regions). If your
+agent id already holds an **in-progress** claim written by a different server
+instance — another agent is live under the same id — `claim()` returns
+`blocked` with a `shared_agent_id` reason naming the task, branch and files that
+would be erased, because one id holds exactly one claim. Give each agent its own
+id; `force=True` overrides it for the legitimate case of a restarted server
+reclaiming its own slot, and then the result carries a `warning` listing the
+files that just lost their protection.
 
 **`release(note="")`** — abandon your current claim **without** marking it done,
 freeing the files for a partner to take over. Use it when you drop a task or step
@@ -138,8 +171,12 @@ to check one specific branch.
 (`planning` | `in-progress` | `done`) and optionally leave a note for your
 partner. Pushes immediately. On `done`, the claim is auto-annotated with
 `changed_files` — your branch's diffstat vs the default branch — so your partner
-reconciles against real data, not just a hand-written summary. (To drop a claim
-without finishing it, use `release()`.)
+reconciles against real data, not just a hand-written summary. It is computed in
+the **board repo**, and a claim records a branch *name* with no repo qualifier,
+so `changed_files_repo` names the repo the diffstat actually came from: where you
+coordinate on a dedicated board repo, a same-named branch there will diff cleanly
+and produce a confidently wrong file list. Check the label before trusting the
+list. (To drop a claim without finishing it, use `release()`.)
 
 **`finish(note="", title="", draft=False)`** — close the loop: mark your claim
 `done` **and** open a GitHub pull request from your claimed branch into the
@@ -173,9 +210,11 @@ your own key — so three, four, or more agents coordinate safely. To run a team
 
 - Invite everyone: `add_collaborator("alice, bob, carol")` (or list them in
   `provision(partner_github=...)`).
-- **Give every person a unique `AGENTSYNC_AGENT_ID`.** Two people sharing an id
-  overwrite each other's claim; `claim()` returns a `warning` when it detects
-  this, but a unique id per person avoids it entirely.
+- **Give every agent a unique `AGENTSYNC_AGENT_ID`** — every *agent*, not every
+  person. One person running a desktop session, a phone and a remote agent needs
+  three ids, for the same reason three people do: one id holds exactly one claim.
+  `claim()` blocks rather than overwriting a live claim under your own id, but a
+  unique id per agent avoids the collision entirely.
 - Contention stays cheap for a handful of agents; with *many* simultaneous
   claimers a `claim()` can return `retry_exhausted` — just call `survey()` and
   retry.
