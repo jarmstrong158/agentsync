@@ -144,8 +144,14 @@ overlaps and with whom. **Overlap is path-aware**: exact match, directory
 containment (`src/api` vs `src/api/routes.py`), and globs (`src/**`, `*.py`) all
 collide, and paths are normalized first (`./auth.py` == `auth.py`). The overlap
 is checked against freshly-fetched state immediately before the push. Pass
-`force=True` to claim anyway (e.g. same large file, disjoint regions). If two
-people share an agent id, the result carries a `warning`.
+`force=True` to claim anyway (e.g. same large file, disjoint regions). If your
+agent id already holds an **in-progress** claim written by a different server
+instance — another agent is live under the same id — `claim()` returns
+`blocked` with a `shared_agent_id` reason naming the task, branch and files that
+would be erased, because one id holds exactly one claim. Give each agent its own
+id; `force=True` overrides it for the legitimate case of a restarted server
+reclaiming its own slot, and then the result carries a `warning` listing the
+files that just lost their protection.
 
 **`release(note="")`** — abandon your current claim **without** marking it done,
 freeing the files for a partner to take over. Use it when you drop a task or step
@@ -165,8 +171,12 @@ to check one specific branch.
 (`planning` | `in-progress` | `done`) and optionally leave a note for your
 partner. Pushes immediately. On `done`, the claim is auto-annotated with
 `changed_files` — your branch's diffstat vs the default branch — so your partner
-reconciles against real data, not just a hand-written summary. (To drop a claim
-without finishing it, use `release()`.)
+reconciles against real data, not just a hand-written summary. It is computed in
+the **board repo**, and a claim records a branch *name* with no repo qualifier,
+so `changed_files_repo` names the repo the diffstat actually came from: where you
+coordinate on a dedicated board repo, a same-named branch there will diff cleanly
+and produce a confidently wrong file list. Check the label before trusting the
+list. (To drop a claim without finishing it, use `release()`.)
 
 **`finish(note="", title="", draft=False)`** — close the loop: mark your claim
 `done` **and** open a GitHub pull request from your claimed branch into the
@@ -200,9 +210,11 @@ your own key — so three, four, or more agents coordinate safely. To run a team
 
 - Invite everyone: `add_collaborator("alice, bob, carol")` (or list them in
   `provision(partner_github=...)`).
-- **Give every person a unique `AGENTSYNC_AGENT_ID`.** Two people sharing an id
-  overwrite each other's claim; `claim()` returns a `warning` when it detects
-  this, but a unique id per person avoids it entirely.
+- **Give every agent a unique `AGENTSYNC_AGENT_ID`** — every *agent*, not every
+  person. One person running a desktop session, a phone and a remote agent needs
+  three ids, for the same reason three people do: one id holds exactly one claim.
+  `claim()` blocks rather than overwriting a live claim under your own id, but a
+  unique id per agent avoids the collision entirely.
 - Contention stays cheap for a handful of agents; with *many* simultaneous
   claimers a `claim()` can return `retry_exhausted` — just call `survey()` and
   retry.

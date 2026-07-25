@@ -695,22 +695,68 @@ def test_survey_flags_stale_claim():
         assert s["partners"]["sleepy"]["age_hours"] > 24, s
 
 
-def test_duplicate_agent_id_warns():
+def _foreign_instance_claim(root, origin, clones, status="in-progress"):
+    """Put a claim under "jonny" stamped by a *different* server instance."""
+    be(clones, "jonny")
+    M.survey()
+    scratch = os.path.join(root, "scratch")
+    git(["clone", "-q", origin, scratch], root)
+    peer_push_claim(scratch, "agentsync", "jonny", {
+        "task": "someone-elses", "touches": ["z.py"], "requires": [],
+        "branch": "other/z", "status": status,
+        "updated_at": M._now(), "instance": "deadbeef", "note": None,
+    })
+    be(clones, "jonny")
+
+
+def test_duplicate_agent_id_blocks_instead_of_clobbering():
+    """One id holds one claim, so claiming over a live one erases it. Refuse.
+
+    The overlap loop skips our own id, so the erased claim's files lose their
+    protection with nothing reporting it -- the failure four agents hit.
+    """
     with lab() as (root, origin, clones):
-        be(clones, "jonny")
-        M.survey()
-        scratch = os.path.join(root, "scratch")
-        git(["clone", "-q", origin, scratch], root)
-        # an entry under "jonny" written by a *different* instance
-        peer_push_claim(scratch, "agentsync", "jonny", {
-            "task": "someone-elses", "touches": ["z.py"], "requires": [],
-            "branch": "other/z", "status": "in-progress",
-            "updated_at": M._now(), "instance": "deadbeef", "note": None,
-        })
-        be(clones, "jonny")
+        _foreign_instance_claim(root, origin, clones)
+        r = json.loads(M.claim("mine", ["a.py"], branch="jonny/a"))
+        assert r["status"] == "blocked", r
+        block = r["conflicts"]["jonny"]
+        assert block["their_task"] == "someone-elses", r
+        reason = block["reasons"][0]
+        assert reason["type"] == "shared_agent_id", r
+        assert reason["files"] == ["z.py"], r  # names what would be lost
+        assert "force=True" in r["message"], r
+        # and the prior claim is untouched on the board
+        assert json.loads(M.survey())["partners"] == {}, "own id is not a peer"
+
+
+def test_duplicate_agent_id_force_still_wins():
+    """DESIGN: advisory, not enforced -- a restarted server reclaims its slot."""
+    with lab() as (root, origin, clones):
+        _foreign_instance_claim(root, origin, clones)
+        r = json.loads(M.claim("mine", ["a.py"], branch="jonny/a", force=True))
+        assert r["status"] == "claimed", r
+        assert "z.py" in r["warning"], r  # says what stopped being protected
+        assert "unique" in r["warning"].lower(), r
+
+
+def test_duplicate_agent_id_ignores_finished_claim():
+    """A 'done' claim holds nothing, so re-claiming the slot is not a clobber."""
+    with lab() as (root, origin, clones):
+        _foreign_instance_claim(root, origin, clones, status="done")
         r = json.loads(M.claim("mine", ["a.py"], branch="jonny/a"))
         assert r["status"] == "claimed", r
-        assert "warning" in r and "unique" in r["warning"].lower(), r
+        assert "warning" not in r, r
+
+
+def test_same_instance_reclaim_is_not_a_collision():
+    """'One unit of work = one claim. Re-claim for the next unit.' (AGENTS.md)"""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        first = json.loads(M.claim("unit one", ["a.py"], branch="jonny/a"))
+        assert first["status"] == "claimed", first
+        second = json.loads(M.claim("unit two", ["b.py"], branch="jonny/a"))
+        assert second["status"] == "claimed", second
+        assert "warning" not in second, second
 
 
 # --------------------------------------------------------------------------- #
@@ -803,6 +849,15 @@ def test_done_captures_changed_files():
         cf = r["claim"]["changed_files"]
         assert cf and any(c["path"] == "auth.py" for c in cf), r
         assert cf[0]["status"] == "A", r  # added file
+        # A claim records a branch NAME only. Where the board repo is not the
+        # work repo, a same-named branch there diffs cleanly and yields a
+        # confidently wrong list, so the diffstat says which repo it came from.
+        slug = r["claim"]["changed_files_repo"]
+        assert isinstance(slug, str) and slug, r
+        assert "\\" not in slug and not slug.endswith(".git"), slug
+        want = os.path.basename(origin)
+        want = want[:-4] if want.endswith(".git") else want
+        assert slug.split("/")[-1] == want, (slug, origin)
 
 
 def test_finish_opens_pr_and_marks_done():
@@ -1066,7 +1121,10 @@ TESTS = [
     test_disjoint_directories_are_clean,
     test_release_frees_the_file,
     test_survey_flags_stale_claim,
-    test_duplicate_agent_id_warns,
+    test_duplicate_agent_id_blocks_instead_of_clobbering,
+    test_duplicate_agent_id_force_still_wins,
+    test_duplicate_agent_id_ignores_finished_claim,
+    test_same_instance_reclaim_is_not_a_collision,
     test_add_multiple_collaborators,
     test_provision_invites_multiple_partners,
     test_history_timeline,

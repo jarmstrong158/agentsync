@@ -321,6 +321,27 @@ def _default_remote_head(cfg):
     return f"{cfg['remote']}/main"
 
 
+def _origin_slug(cfg):
+    """'owner/name' behind cfg's remote, for labelling which repo a diffstat
+    came from. Reads git config rather than `gh` (cf. _repo_slug) so annotating
+    a finished claim never depends on the GitHub CLI being present or online."""
+    p = _git(["remote", "get-url", cfg["remote"]], cfg["repo"], check=False)
+    url = (p.stdout or "").strip() or cfg["repo"]
+    if url.endswith(".git"):
+        url = url[:-4]
+    if "://" in url:                                  # scheme://host/owner/name
+        tail = url.split("://", 1)[1].split("/")[1:]
+    elif "@" in url.split(":", 1)[0] and ":" in url:  # git@host:owner/name
+        tail = url.split(":", 1)[1].split("/")
+    else:
+        # A filesystem path: a local board, or a test fixture. There is no
+        # owner/name to report, so name the directory rather than mangling
+        # a Windows drive letter into something that looks like a slug.
+        return os.path.basename(url.rstrip("/\\"))
+    tail = [s for s in tail if s]
+    return "/".join(tail[-2:]) if tail else url
+
+
 def _branch_changes(cfg, branch):
     """The files a claimed branch changed vs the default branch (three-dot, so
     only this branch's own work). Returns a list of {status, path}, or None if
@@ -882,17 +903,61 @@ def claim(
         data = _read_claims(cfg)
         claims = data["claims"]
 
-        # duplicate-id guard: our id already holds an active claim stamped by a
-        # *different* server process -> likely two people sharing one agent id.
+        # duplicate-id guard: our id already holds an in-progress claim stamped
+        # by a *different* server process. claims.json holds exactly one claim
+        # per agent id, so writing now erases that claim outright and there is
+        # nothing left to recover it from -- and because the overlap loop below
+        # skips our own id, the files it was holding lose their protection
+        # silently. Refuse by default. `force` still wins, so a restarted server
+        # reclaiming its own slot is one call away, per DESIGN "advisory, not
+        # enforced" -- what changes is that the destructive path is now chosen,
+        # not stumbled into.
         prior = claims.get(cfg["agent"])
+        shared_id = bool(
+            prior
+            and prior.get("instance")
+            and prior.get("instance") != INSTANCE
+            and prior.get("status") == "in-progress"
+        )
+
+        if shared_id and not force:
+            return json.dumps(
+                {
+                    "status": "blocked",
+                    "message": (
+                        f"Agent id '{cfg['agent']}' already holds an in-progress "
+                        "claim written by a different agentsync instance, and "
+                        "one id holds exactly one claim -- claiming now would "
+                        "erase it. If another agent is live under this id, give "
+                        "each one its own AGENTSYNC_AGENT_ID. If that session is "
+                        "gone (a restarted server reclaiming its own slot), "
+                        "re-call with force=True."
+                    ),
+                    "conflicts": {
+                        cfg["agent"]: {
+                            "their_task": prior.get("task"),
+                            "their_branch": prior.get("branch"),
+                            "reasons": [
+                                {
+                                    "type": "shared_agent_id",
+                                    "files": list(prior.get("touches", [])),
+                                    "held_since": prior.get("updated_at"),
+                                }
+                            ],
+                        }
+                    },
+                },
+                indent=2,
+            )
+
         dup_warn = None
-        if (prior and prior.get("instance") and prior.get("instance") != INSTANCE
-                and prior.get("status") == "in-progress"):
+        if shared_id:  # reached only with force=True
+            lost = ", ".join(prior.get("touches", [])) or "(none declared)"
             dup_warn = (
-                f"Agent id '{cfg['agent']}' already holds an in-progress claim "
-                "written by a different agentsync instance. If a teammate is "
-                "using the same AGENTSYNC_AGENT_ID, give each person a unique id "
-                "— otherwise you overwrite each other's claims."
+                f"Forced past an in-progress claim held by another instance of "
+                f"agent id '{cfg['agent']}'. That claim is gone and these files "
+                f"are no longer protected: {lost}. Give each concurrent agent a "
+                "unique AGENTSYNC_AGENT_ID."
             )
 
         if not force:
@@ -1108,6 +1173,14 @@ def _set_status(cfg, status, note):
                 done_changes = _branch_changes(cfg, mine["branch"])
                 computed = True
             mine["changed_files"] = done_changes
+            # Name the repo the diffstat came from. A claim records a branch
+            # NAME with no repo qualifier, so where the board repo is not the
+            # work repo, a same-named branch in the board repo diffs cleanly
+            # and yields a confidently wrong file list. Labelling it makes
+            # "these are my files" and "these are some other repo's files"
+            # distinguishable, the same way survey() reports board {repo,
+            # source} rather than letting a wrong board look like a quiet one.
+            mine["changed_files_repo"] = _origin_slug(cfg)
         _write_claims_atomic(os.path.join(cfg["worktree"], CLAIMS_FILE), data)
         if _commit_and_push(cfg, f"agentsync: {cfg['agent']} -> {status}"):
             return True, mine
