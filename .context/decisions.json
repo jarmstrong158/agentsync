@@ -24,5 +24,51 @@
     "created_at": "2026-07-21T14:31:25.740224+00:00",
     "updated_at": "2026-07-21T14:31:25.740224+00:00",
     "verified_at": "2026-07-21T14:31:25.740224+00:00"
+  },
+  {
+    "id": "dec-002-90ef",
+    "summary": "claim() refuses when the agent id already holds an in-progress claim written by a different server instance, returning status \"blocked\" with a shared_agent_id reason. force=True still overrides. Claims stay keyed by agent id alone.",
+    "problem": "claims.json holds exactly one claim per agent id. A second agent running under the same AGENTSYNC_AGENT_ID overwrote the first agent's claim and got status \"claimed\" back. The duplicate-instance warning was attached to that success result, so it was produced after the claim it warned about was already erased, with nothing left to recover it from. Worse, the overlap loop skips our own id, so the erased claim's files lost their protection silently: a third agent would survey, see nothing holding them, and edit. Four independent agents reported this before it was traced.",
+    "why_chosen": "DESIGN framed shared ids as two PEOPLE sharing an id, where a non-fatal warning would route them to the real fix (unique ids). The actual common case is one person running several agents (desktop, phone, remote) - the same collision with no second person to read the warning. Blocking makes the destructive path chosen rather than stumbled into, while force=True preserves DESIGN's \"advisory, not enforced\" principle so a restarted server reclaiming its own slot is one call away. The block message names the task, branch and files that would be lost, and points at the real fix.",
+    "what_we_tried": "",
+    "tradeoffs": "A genuine server restart that left an in-progress claim behind now needs one extra force=True call to reclaim its own slot, where before it succeeded silently. Accepted because that is exactly the moment you should look at what you are about to erase. Also a behaviour change for any caller that relied on claim() always succeeding.",
+    "alternatives": [
+      {
+        "option": "Key claims by agent+instance so concurrent sessions each hold their own claim and overlap detection works between them",
+        "reason_rejected": "The instance token changes on every server restart, so claims would accumulate with no sanctioned way to reap them. DESIGN explicitly rejects auto-expiry ('would race a slow-but-alive partner') and instead surfaces staleness via survey(). Instance-keying plus no auto-expiry means unbounded orphan accumulation, which contradicts a standing design decision."
+      },
+      {
+        "option": "Keep the advisory warning but preserve the clobbered claim somewhere recoverable",
+        "reason_rejected": "Adds a second storage concept (shadow/archived claims) to a format whose whole point is one shared claims.json, and still leaves the window where the files are unprotected and no live claim reports them."
+      },
+      {
+        "option": "Stop skipping same-id peers in the overlap loop instead of blocking",
+        "reason_rejected": "Strictly weaker: it only fires when the files overlap, so a same-id agent claiming DIFFERENT files would still silently erase the other claim. The block covers both."
+      }
+    ],
+    "constraints_created": [
+      "Every concurrent AGENT needs its own AGENTSYNC_AGENT_ID - not every person. One person running a desktop session, a phone and a remote agent needs three ids, because one id holds exactly one claim."
+    ],
+    "related_to": [],
+    "tags": [
+      "agentsync",
+      "claims",
+      "concurrency",
+      "identity",
+      "coordination"
+    ],
+    "retrieval_hints": [
+      "agentsync claim collision",
+      "two agents same AGENTSYNC_AGENT_ID overwrite each other",
+      "claim returned blocked shared_agent_id",
+      "why did my claim disappear from the board"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-25T13:45:38.391740+00:00",
+    "updated_at": "2026-07-25T13:45:38.391740+00:00",
+    "verified_at": "2026-07-25T13:45:38.391740+00:00"
   }
 ]

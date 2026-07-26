@@ -872,6 +872,15 @@ def survey() -> str:
             "board": {"repo": cfg["repo"], "source": cfg["board_source"]},
             "partners": others,
             "stale_claims": stale,
+            # YOUR OWN current claim. `partners` deliberately excludes you, so
+            # before this key there was no way to ask "what am I holding?" —
+            # check_conflicts() returns early ("No partner branches to check")
+            # when you are the only active agent, so it could not answer either.
+            # That gap matters at release()/finish() time: one agent id holds
+            # exactly one claim, so a concurrent session can replace yours, and
+            # closing "your" claim without looking closes whatever now occupies
+            # the slot. None when you hold nothing.
+            "my_claim": claims.get(cfg["agent"]),
         },
         indent=2,
     )

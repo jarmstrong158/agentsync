@@ -677,6 +677,32 @@ def test_release_frees_the_file():
         assert r["status"] == "claimed", r
 
 
+def test_survey_reports_my_own_claim():
+    """survey()['partners'] deliberately EXCLUDES you, so before `my_claim`
+    there was no way to ask "what am I currently holding?" — and
+    check_conflicts() returns early when you are the only active agent, so it
+    could not answer either.
+
+    That gap bites at release()/finish() time: one agent id holds exactly one
+    claim, so a concurrent session under the same id can replace yours, and
+    closing "your" claim without looking closes whatever now occupies the slot.
+    AGENTS.md says "Query, never assume" — this is what makes that queryable
+    for your own claim, not just for partners'.
+    """
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        # nothing held yet -> explicit None, not a missing key
+        assert json.loads(M.survey())["my_claim"] is None
+
+        M.claim("auth", ["auth.py"], branch="jonny/auth")
+        mine = json.loads(M.survey())["my_claim"]
+        assert mine is not None, "survey must echo my own claim"
+        assert mine["task"] == "auth", mine
+        assert mine["touches"] == ["auth.py"], mine
+        # and it is still absent from `partners`, which is about OTHER agents
+        assert "jonny" not in json.loads(M.survey())["partners"]
+
+
 def test_survey_flags_stale_claim():
     with lab() as (root, origin, clones):
         be(clones, "jonny")
