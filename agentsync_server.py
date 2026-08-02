@@ -66,9 +66,27 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.caching import CacheHint
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("agentsync")
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("agentsync")
+except Exception:
+    __version__ = "0.0.0+local"
+
+# The tool list is static code, identical for every caller with no auth-scoped
+# variation, so a shared intermediary may cache it. Tool *results* are
+# caller-specific (they report who holds which claim), but tools/call is not a
+# cacheable method, so none of that is cached.
+mcp = MCPServer(
+    "agentsync",
+    version=__version__,
+    cache_hints={
+        "tools/list": CacheHint(ttl_ms=300_000, scope="public"),
+        "server/discover": CacheHint(ttl_ms=300_000, scope="public"),
+    },
+)
 
 CLAIMS_FILE = "claims.json"
 PUSH_RETRIES = 5
