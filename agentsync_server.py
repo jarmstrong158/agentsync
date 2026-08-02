@@ -912,12 +912,32 @@ def claim(
     branch: str = "",
     force: bool = False,
 ) -> str:
-    """Stake a claim on a unit of work.
+    """Stake a claim on a unit of work, so a partner cannot start the same files
+    underneath you.
 
-    touches  : files/modules you will modify
-    requires : files/modules you depend on (omit if none)
+    When to use this instead of the alternatives:
+      claim           : you are about to START work. Call it BEFORE editing,
+                        not after — a claim taken afterwards cannot prevent the
+                        collision it was meant to catch.
+      survey          : just look at who holds what, changing nothing.
+      check_conflicts : you already hold a claim and want to know whether your
+                        branch now collides with a peer's.
+      update_status   : you already hold this claim and only the status or note
+                        has changed. Re-claiming to edit a claim replaces it.
+
+    task     : what you are building, in a few words. This is what a partner
+               reads in survey() to decide whether your work blocks theirs, so
+               "migrate the auth middleware" beats "fixes".
+    touches  : files/modules you will modify — the "get in the way" check.
+               Overlap is set intersection against peers' touches, so name the
+               real paths you will edit; a directory only matches a peer who
+               named that same directory, not files inside it.
+    requires : files/modules you depend on but will NOT edit (omit if none) —
+               the "rely on their build" check.
     branch   : the branch your work will live on
-    force    : claim even if an overlap with an active peer claim is detected
+    force    : claim even if an overlap with an active peer claim is detected.
+               Use it only after talking to the peer; it does not resolve the
+               collision, it just proceeds despite it.
 
     Refuses (status="blocked") if your plan collides with a peer's active claim,
     returning exactly what overlaps and with whom, unless force=True. The
@@ -1157,7 +1177,18 @@ def release(note: str = "") -> str:
     were holding so a partner can take them over. Use this when you're dropping
     the task or stepping away — otherwise a crashed or abandoned claim blocks
     those files indefinitely (the only other exits are 'done' or manual git
-    surgery). Pushes immediately."""
+    surgery). Pushes immediately.
+
+    note : optional free text recording WHY you are dropping the claim, e.g.
+           "blocked on the API rewrite, not started" or "handing over to Sam".
+           It replaces the claim's existing note and is what a partner reads in
+           history() when deciding whether to pick the work up, so a released
+           claim with no note leaves them guessing whether anything was done.
+
+    Only your OWN claim can be released; you cannot release a partner's. The
+    release is recorded in history rather than erased, so the attempt is still
+    visible afterwards. Returns JSON with the released claim, or an error if you
+    hold no active claim."""
     cfg = _cfg()
     for attempt in range(PUSH_RETRIES):
         _ensure_worktree(cfg)
