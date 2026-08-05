@@ -215,6 +215,15 @@ your own key — so three, four, or more agents coordinate safely. To run a team
   three ids, for the same reason three people do: one id holds exactly one claim.
   `claim()` blocks rather than overwriting a live claim under your own id, but a
   unique id per agent avoids the collision entirely.
+
+  This guard used to key on a per-**process** token, which meant it caught a
+  restarted server and waved through a *concurrent session* -- one agentsync
+  process serves every session on a machine, so two sessions shared the token
+  and silently overwrote each other. It now keys on the **work**: a claim for a
+  different task, while one is in progress under your id, is refused whatever
+  process wrote it. Re-claiming the *same* task stays free, which is how you
+  widen `touches` mid-unit. `release(expect_task=...)` covers the other
+  direction, refusing to close a claim that is not the one you think you hold.
 - Contention stays cheap for a handful of agents; with *many* simultaneous
   claimers a `claim()` can return `retry_exhausted` — just call `survey()` and
   retry.
@@ -226,13 +235,13 @@ python3 test_agentsync.py     # unit + protocol suite (real git repos)
 python3 test_workflow.py      # two-person lifecycle + real MCP stdio transport
 ```
 
-`test_agentsync.py` (35 cases, isolated per test) covers the protocol (claim/
+`test_agentsync.py` (51 cases, isolated per test) covers the protocol (claim/
 block on shared files and dependency-on-WIP, force override, done-claims-don't-
 block, status validation), **path-aware overlap** (directory containment, globs,
 normalization, disjoint-dirs-are-clean), conflict detection (textual conflict and
 clean-merge), the **compare-and-swap guarantee** (a peer claim landing mid-flight
 both survives our retry and is observed in time to block a collision), liveness
-(`release`, `stale` flagging, the duplicate-id warning), the review loop
+(`release`, `stale` flagging, the live-claim guard against concurrent sessions), the review loop
 (`history` timeline, `done` diffstat capture, `finish` opening/reusing a PR,
 push-required guard), error paths, and provisioning + `add_collaborator` (single
 and multi-invite, partner-from-env, existing-remote skip, invite-failure
