@@ -950,35 +950,56 @@ def claim(
         data = _read_claims(cfg)
         claims = data["claims"]
 
-        # duplicate-id guard: our id already holds an in-progress claim stamped
-        # by a *different* server process. claims.json holds exactly one claim
-        # per agent id, so writing now erases that claim outright and there is
-        # nothing left to recover it from -- and because the overlap loop below
-        # skips our own id, the files it was holding lose their protection
-        # silently. Refuse by default. `force` still wins, so a restarted server
-        # reclaiming its own slot is one call away, per DESIGN "advisory, not
-        # enforced" -- what changes is that the destructive path is now chosen,
-        # not stumbled into.
+        # live-claim guard: our id already holds an IN-PROGRESS claim for
+        # different work. claims.json holds exactly one claim per agent id, so
+        # writing now erases that claim outright and there is nothing left to
+        # recover it from -- and because the overlap loop below skips our own
+        # id, the files it was holding lose their protection silently. Refuse by
+        # default. `force` still wins, per DESIGN "advisory, not enforced" --
+        # what changes is that the destructive path is chosen, not stumbled into.
+        #
+        # This used to additionally require `instance != INSTANCE`, which made it
+        # blind to the case that actually loses work. INSTANCE is generated once
+        # per SERVER PROCESS, and one agentsync process serves every session on
+        # the machine, so two concurrent sessions share it: the guard caught a
+        # RESTARTED server and waved through a CONCURRENT one. Observed live on
+        # 2026-08-05 -- a session claimed over another session's in-progress
+        # meristem claim, same instance e8544d39, status "claimed", no warning.
+        #
+        # The discriminator is the WORK, not the process. A prior in-progress
+        # claim for a different task is either a peer session or your own
+        # unclosed unit; both want the same remedy (close it first), and neither
+        # should happen by accident. Re-claiming the SAME task stays free, which
+        # is how you widen `touches` or correct a branch mid-unit.
         prior = claims.get(cfg["agent"])
         shared_id = bool(
             prior
-            and prior.get("instance")
-            and prior.get("instance") != INSTANCE
             and prior.get("status") == "in-progress"
+            and (prior.get("task") or "") != task
         )
+        same_process = bool(prior and prior.get("instance") == INSTANCE)
 
         if shared_id and not force:
+            # Same process is the MORE dangerous case, not the safer one: it
+            # means a concurrent session under this id, and the old guard let it
+            # straight through.
+            origin = (
+                "by another session sharing this server process"
+                if same_process
+                else "by a different agentsync instance"
+            )
             return json.dumps(
                 {
                     "status": "blocked",
                     "message": (
                         f"Agent id '{cfg['agent']}' already holds an in-progress "
-                        "claim written by a different agentsync instance, and "
-                        "one id holds exactly one claim -- claiming now would "
-                        "erase it. If another agent is live under this id, give "
-                        "each one its own AGENTSYNC_AGENT_ID. If that session is "
-                        "gone (a restarted server reclaiming its own slot), "
-                        "re-call with force=True."
+                        f"claim for different work, written {origin}, and one id "
+                        "holds exactly one claim -- claiming now would erase it. "
+                        "If you finished that unit, close it first with "
+                        "update_status('done') or release(). If another agent is "
+                        "live under this id, give each one its own "
+                        "AGENTSYNC_AGENT_ID. Re-call with force=True only after "
+                        "checking which of those it is."
                     ),
                     "conflicts": {
                         cfg["agent"]: {
@@ -1001,10 +1022,10 @@ def claim(
         if shared_id:  # reached only with force=True
             lost = ", ".join(prior.get("touches", [])) or "(none declared)"
             dup_warn = (
-                f"Forced past an in-progress claim held by another instance of "
-                f"agent id '{cfg['agent']}'. That claim is gone and these files "
-                f"are no longer protected: {lost}. Give each concurrent agent a "
-                "unique AGENTSYNC_AGENT_ID."
+                f"Forced past an in-progress claim ('{prior.get('task')}') held "
+                f"under agent id '{cfg['agent']}'. That claim is gone and these "
+                f"files are no longer protected: {lost}. If a concurrent session "
+                "was holding them, give each one a unique AGENTSYNC_AGENT_ID."
             )
 
         if not force:
@@ -1172,7 +1193,7 @@ def check_conflicts(against_branch: str = "") -> str:
 
 
 @mcp.tool()
-def release(note: str = "") -> str:
+def release(note: str = "", expect_task: str = "") -> str:
     """Abandon your current claim WITHOUT marking it done, freeing the files you
     were holding so a partner can take them over. Use this when you're dropping
     the task or stepping away — otherwise a crashed or abandoned claim blocks
@@ -1185,6 +1206,14 @@ def release(note: str = "") -> str:
            history() when deciding whether to pick the work up, so a released
            claim with no note leaves them guessing whether anything was done.
 
+    expect_task : optional guard. When given, the release only proceeds if the
+           claim actually sitting in your slot has this task. One agent id holds
+           exactly one claim, so a concurrent session under the same id can
+           replace yours between your claim() and your release() -- and a blind
+           release then closes THEIR work, silently, while reporting success.
+           Pass the task you believe you hold (claim() echoes it back) and a
+           mismatch is refused instead of discovered later.
+
     Only your OWN claim can be released; you cannot release a partner's. The
     release is recorded in history rather than erased, so the attempt is still
     visible afterwards. Returns JSON with the released claim, or an error if you
@@ -1196,6 +1225,23 @@ def release(note: str = "") -> str:
         if cfg["agent"] not in data["claims"]:
             return json.dumps(
                 {"status": "noop", "message": "You have no active claim to release."}
+            )
+        occupant = data["claims"][cfg["agent"]]
+        if expect_task and (occupant.get("task") or "") != expect_task:
+            return json.dumps(
+                {
+                    "status": "blocked",
+                    "message": (
+                        "The claim in your slot is not the one you expected, so "
+                        "releasing it would close work you did not do. Expected "
+                        f"'{expect_task}', found '{occupant.get('task')}'. A "
+                        "concurrent session under agent id "
+                        f"'{cfg['agent']}' has taken the slot -- give each "
+                        "session its own AGENTSYNC_AGENT_ID."
+                    ),
+                    "found": occupant,
+                },
+                indent=2,
             )
         released = data["claims"].pop(cfg["agent"])
         _write_claims_atomic(os.path.join(cfg["worktree"], CLAIMS_FILE), data)

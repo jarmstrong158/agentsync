@@ -145,13 +145,32 @@ modes erode that, each with a minimal countermeasure:
   top-level `stale_claims` list. The judgment call — nudge them, or `force` past
   it — stays with the agent; the server only makes the staleness visible.
 - **Shared agent id.** `claims.json` holds exactly one claim per agent id, so two
-  agents sharing `AGENTSYNC_AGENT_ID="claude"` write to the same key. Each server
-  process stamps a random `instance` token on the claims it writes; `claim()`
-  **refuses** when the id it's about to take is already held *in-progress* by a
-  *different* instance, naming the task, branch and files that would be lost.
-  `force=True` overrides — a restarted server reclaiming its own slot is one call
-  away, so this is still advisory in the sense that matters. What changed is that
-  the destructive path is now chosen rather than stumbled into.
+  agents sharing `AGENTSYNC_AGENT_ID="claude"` write to the same key. `claim()`
+  **refuses** when the id it's about to take is already held *in-progress* for
+  **different work**, naming the task, branch and files that would be lost.
+  Re-claiming the *same* task is free — that is how you widen `touches` mid-unit.
+  `force=True` overrides, so this is still advisory in the sense that matters.
+  What changed is that the destructive path is now chosen rather than stumbled
+  into.
+
+  The discriminator is the **work, not the process**, and that is a correction.
+  The guard originally also required the prior claim's `instance` token to
+  differ, on the reasoning that a matching token meant "the same agent moving to
+  its next unit". But `instance` is generated once per *server process*, and one
+  agentsync process serves every session on the machine — so two concurrent
+  sessions share it. The guard caught a **restarted** server and waved through a
+  **concurrent** one, which is the case that actually loses work. Observed live
+  on 2026-08-05: a session claimed straight over another session's in-progress
+  claim, same instance, status `claimed`, no warning, and the overwritten
+  claim's files silently lost their protection. `instance` is still recorded and
+  still shapes the *message* (it distinguishes "another session sharing this
+  process" from "a different instance"), it just no longer gates the refusal.
+
+  The same hazard runs the other way at close time: a concurrent session can take
+  the slot between your `claim()` and your `release()`, so a blind release closes
+  *their* work while reporting success. `release(expect_task=...)` refuses when
+  the claim sitting in the slot is not the one you think you hold. It is optional
+  and additive — callers that omit it behave exactly as before.
 
   This was originally a non-fatal warning, on the assumption that a shared id
   meant *two people* and the warning would route them to the real fix (unique
