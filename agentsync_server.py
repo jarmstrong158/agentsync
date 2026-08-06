@@ -91,6 +91,51 @@ mcp = MCPServer(
 CLAIMS_FILE = "claims.json"
 PUSH_RETRIES = 5
 
+# Returned by _with_claims when every push attempt lost the race. A sentinel
+# rather than None so a mutate() that legitimately returns None is unambiguous.
+_RETRY_EXHAUSTED = object()
+
+
+class _ClaimAbort(Exception):
+    """Stop the read-modify-write and return `payload` to the caller, unwritten.
+
+    Used for every "do not proceed" answer -- no claim to update, the slot holds
+    someone else's work, an overlap with a peer. Raising rather than returning
+    keeps _with_claims' contract to one shape.
+    """
+
+    def __init__(self, payload):
+        super().__init__("claim aborted")
+        self.payload = payload
+
+
+def _with_claims(cfg, mutate):
+    """Read claims.json, mutate it, write and push -- retrying the whole cycle.
+
+    `mutate(data, attempt)` returns `(result, commit_message)`, or raises
+    _ClaimAbort to bail out without writing.
+
+    Every retry RE-READS, which is the compare-and-swap that makes concurrent
+    boards safe: a peer who pushed between our read and our failed push is seen
+    on the next attempt, so their claim is never silently overwritten. That
+    invariant was written out three times -- claim, release and _set_status each
+    had their own copy of the loop, the sleep and the exhausted return -- in a
+    tool whose entire job is safe concurrent updates. One copy now, because
+    this is precisely the code where a divergent copy is most expensive.
+    """
+    for attempt in range(PUSH_RETRIES):
+        _ensure_worktree(cfg)
+        data = _read_claims(cfg)
+        try:
+            result, message = mutate(data, attempt)
+        except _ClaimAbort as abort:
+            return abort.payload
+        _write_claims_atomic(os.path.join(cfg["worktree"], CLAIMS_FILE), data)
+        if _commit_and_push(cfg, message):
+            return result
+        time.sleep(0.4 * (attempt + 1))  # contended; back off and retry
+    return _RETRY_EXHAUSTED
+
 # A random token per running server process. Stamped onto every claim this
 # process writes so we can detect when a second collaborator has picked the same
 # AGENTSYNC_AGENT_ID (they'd otherwise silently overwrite each other's entry).
@@ -945,40 +990,60 @@ def claim(
     push, so a peer who claimed first will be seen here."""
     cfg = _cfg()
     requires = requires or []
-    for attempt in range(PUSH_RETRIES):
-        _ensure_worktree(cfg)
-        data = _read_claims(cfg)
+
+    def _mutate(data, _attempt):
         claims = data["claims"]
 
-        # duplicate-id guard: our id already holds an in-progress claim stamped
-        # by a *different* server process. claims.json holds exactly one claim
-        # per agent id, so writing now erases that claim outright and there is
-        # nothing left to recover it from -- and because the overlap loop below
-        # skips our own id, the files it was holding lose their protection
-        # silently. Refuse by default. `force` still wins, so a restarted server
-        # reclaiming its own slot is one call away, per DESIGN "advisory, not
-        # enforced" -- what changes is that the destructive path is now chosen,
-        # not stumbled into.
+        # live-claim guard: our id already holds an IN-PROGRESS claim for
+        # different work. claims.json holds exactly one claim per agent id, so
+        # writing now erases that claim outright and there is nothing left to
+        # recover it from -- and because the overlap loop below skips our own
+        # id, the files it was holding lose their protection silently. Refuse by
+        # default. `force` still wins, per DESIGN "advisory, not enforced" --
+        # what changes is that the destructive path is chosen, not stumbled into.
+        #
+        # This used to additionally require `instance != INSTANCE`, which made it
+        # blind to the case that actually loses work. INSTANCE is generated once
+        # per SERVER PROCESS, and one agentsync process serves every session on
+        # the machine, so two concurrent sessions share it: the guard caught a
+        # RESTARTED server and waved through a CONCURRENT one. Observed live on
+        # 2026-08-05 -- a session claimed over another session's in-progress
+        # meristem claim, same instance e8544d39, status "claimed", no warning.
+        #
+        # The discriminator is the WORK, not the process. A prior in-progress
+        # claim for a different task is either a peer session or your own
+        # unclosed unit; both want the same remedy (close it first), and neither
+        # should happen by accident. Re-claiming the SAME task stays free, which
+        # is how you widen `touches` or correct a branch mid-unit.
         prior = claims.get(cfg["agent"])
         shared_id = bool(
             prior
-            and prior.get("instance")
-            and prior.get("instance") != INSTANCE
             and prior.get("status") == "in-progress"
+            and (prior.get("task") or "") != task
         )
+        same_process = bool(prior and prior.get("instance") == INSTANCE)
 
         if shared_id and not force:
-            return json.dumps(
+            # Same process is the MORE dangerous case, not the safer one: it
+            # means a concurrent session under this id, and the old guard let it
+            # straight through.
+            origin = (
+                "by another session sharing this server process"
+                if same_process
+                else "by a different agentsync instance"
+            )
+            raise _ClaimAbort(json.dumps(
                 {
                     "status": "blocked",
                     "message": (
                         f"Agent id '{cfg['agent']}' already holds an in-progress "
-                        "claim written by a different agentsync instance, and "
-                        "one id holds exactly one claim -- claiming now would "
-                        "erase it. If another agent is live under this id, give "
-                        "each one its own AGENTSYNC_AGENT_ID. If that session is "
-                        "gone (a restarted server reclaiming its own slot), "
-                        "re-call with force=True."
+                        f"claim for different work, written {origin}, and one id "
+                        "holds exactly one claim -- claiming now would erase it. "
+                        "If you finished that unit, close it first with "
+                        "update_status('done') or release(). If another agent is "
+                        "live under this id, give each one its own "
+                        "AGENTSYNC_AGENT_ID. Re-call with force=True only after "
+                        "checking which of those it is."
                     ),
                     "conflicts": {
                         cfg["agent"]: {
@@ -995,16 +1060,16 @@ def claim(
                     },
                 },
                 indent=2,
-            )
+            ))
 
         dup_warn = None
         if shared_id:  # reached only with force=True
             lost = ", ".join(prior.get("touches", [])) or "(none declared)"
             dup_warn = (
-                f"Forced past an in-progress claim held by another instance of "
-                f"agent id '{cfg['agent']}'. That claim is gone and these files "
-                f"are no longer protected: {lost}. Give each concurrent agent a "
-                "unique AGENTSYNC_AGENT_ID."
+                f"Forced past an in-progress claim ('{prior.get('task')}') held "
+                f"under agent id '{cfg['agent']}'. That claim is gone and these "
+                f"files are no longer protected: {lost}. If a concurrent session "
+                "was holding them, give each one a unique AGENTSYNC_AGENT_ID."
             )
 
         if not force:
@@ -1020,7 +1085,7 @@ def claim(
                         "reasons": reasons,
                     }
             if blocks:
-                return json.dumps(
+                raise _ClaimAbort(json.dumps(
                     {
                         "status": "blocked",
                         "message": "Overlap with an active peer claim. "
@@ -1028,7 +1093,7 @@ def claim(
                         "conflicts": blocks,
                     },
                     indent=2,
-                )
+                ))
 
         claims[cfg["agent"]] = {
             "task": task,
@@ -1040,17 +1105,19 @@ def claim(
             "instance": INSTANCE,
             "note": None,
         }
-        _write_claims_atomic(os.path.join(cfg["worktree"], CLAIMS_FILE), data)
-        if _commit_and_push(cfg, f"agentsync: {cfg['agent']} claims '{task}'"):
-            result = {"status": "claimed", "claim": claims[cfg["agent"]]}
-            if dup_warn:
-                result["warning"] = dup_warn
-            return json.dumps(result, indent=2)
-        time.sleep(0.4 * (attempt + 1))  # contended; back off and retry
-    return json.dumps(
-        {"status": "retry_exhausted", "message": "Push kept losing the race; "
-         "call survey() and try again."}
-    )
+        result = {"status": "claimed", "claim": claims[cfg["agent"]]}
+        if dup_warn:
+            result["warning"] = dup_warn
+        return (json.dumps(result, indent=2),
+                f"agentsync: {cfg['agent']} claims '{task}'")
+
+    out = _with_claims(cfg, _mutate)
+    if out is _RETRY_EXHAUSTED:
+        return json.dumps(
+            {"status": "retry_exhausted", "message": "Push kept losing the race; "
+             "call survey() and try again."}
+        )
+    return out
 
 
 @mcp.tool()
@@ -1172,7 +1239,7 @@ def check_conflicts(against_branch: str = "") -> str:
 
 
 @mcp.tool()
-def release(note: str = "") -> str:
+def release(note: str = "", expect_task: str = "") -> str:
     """Abandon your current claim WITHOUT marking it done, freeing the files you
     were holding so a partner can take them over. Use this when you're dropping
     the task or stepping away — otherwise a crashed or abandoned claim blocks
@@ -1185,27 +1252,50 @@ def release(note: str = "") -> str:
            history() when deciding whether to pick the work up, so a released
            claim with no note leaves them guessing whether anything was done.
 
+    expect_task : optional guard. When given, the release only proceeds if the
+           claim actually sitting in your slot has this task. One agent id holds
+           exactly one claim, so a concurrent session under the same id can
+           replace yours between your claim() and your release() -- and a blind
+           release then closes THEIR work, silently, while reporting success.
+           Pass the task you believe you hold (claim() echoes it back) and a
+           mismatch is refused instead of discovered later.
+
     Only your OWN claim can be released; you cannot release a partner's. The
     release is recorded in history rather than erased, so the attempt is still
     visible afterwards. Returns JSON with the released claim, or an error if you
     hold no active claim."""
     cfg = _cfg()
-    for attempt in range(PUSH_RETRIES):
-        _ensure_worktree(cfg)
-        data = _read_claims(cfg)
+
+    def _mutate(data, _attempt):
         if cfg["agent"] not in data["claims"]:
-            return json.dumps(
+            raise _ClaimAbort(json.dumps(
                 {"status": "noop", "message": "You have no active claim to release."}
-            )
+            ))
+        occupant = data["claims"][cfg["agent"]]
+        if expect_task and (occupant.get("task") or "") != expect_task:
+            raise _ClaimAbort(json.dumps(
+                {
+                    "status": "blocked",
+                    "message": (
+                        "The claim in your slot is not the one you expected, so "
+                        "releasing it would close work you did not do. Expected "
+                        f"'{expect_task}', found '{occupant.get('task')}'. A "
+                        "concurrent session under agent id "
+                        f"'{cfg['agent']}' has taken the slot -- give each "
+                        "session its own AGENTSYNC_AGENT_ID."
+                    ),
+                    "found": occupant,
+                },
+                indent=2,
+            ))
         released = data["claims"].pop(cfg["agent"])
-        _write_claims_atomic(os.path.join(cfg["worktree"], CLAIMS_FILE), data)
         msg = f"agentsync: {cfg['agent']} releases '{released.get('task')}'"
         if note:
             msg += f" ({note})"
-        if _commit_and_push(cfg, msg):
-            return json.dumps({"status": "released", "released": released}, indent=2)
-        time.sleep(0.4 * (attempt + 1))
-    return json.dumps({"status": "retry_exhausted"})
+        return json.dumps({"status": "released", "released": released}, indent=2), msg
+
+    out = _with_claims(cfg, _mutate)
+    return json.dumps({"status": "retry_exhausted"}) if out is _RETRY_EXHAUSTED else out
 
 
 def _set_status(cfg, status, note):
@@ -1215,12 +1305,12 @@ def _set_status(cfg, status, note):
     dict on success or an error/status string on failure."""
     done_changes = None
     computed = False
-    for attempt in range(PUSH_RETRIES):
-        _ensure_worktree(cfg)
-        data = _read_claims(cfg)
+
+    def _mutate(data, _attempt):
+        nonlocal done_changes, computed
         mine = data["claims"].get(cfg["agent"])
         if not mine:
-            return False, "No claim to update. Call claim() first."
+            raise _ClaimAbort((False, "No claim to update. Call claim() first."))
         mine["status"] = status
         mine["updated_at"] = _now()
         mine["instance"] = INSTANCE
@@ -1239,11 +1329,10 @@ def _set_status(cfg, status, note):
             # distinguishable, the same way survey() reports board {repo,
             # source} rather than letting a wrong board look like a quiet one.
             mine["changed_files_repo"] = _origin_slug(cfg)
-        _write_claims_atomic(os.path.join(cfg["worktree"], CLAIMS_FILE), data)
-        if _commit_and_push(cfg, f"agentsync: {cfg['agent']} -> {status}"):
-            return True, mine
-        time.sleep(0.4 * (attempt + 1))
-    return False, "retry_exhausted"
+        return (True, mine), f"agentsync: {cfg['agent']} -> {status}"
+
+    out = _with_claims(cfg, _mutate)
+    return (False, "retry_exhausted") if out is _RETRY_EXHAUSTED else out
 
 
 @mcp.tool()

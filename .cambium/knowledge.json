@@ -1,0 +1,242 @@
+{
+  "items": [
+    {
+      "id": "k-30d655c0",
+      "type": "memory",
+      "kind": "decision",
+      "content": "_cfg now falls back to the shared Xylem session pointer (~/.xylem/active_project.json) when AGENTSYNC_REPO is unset, so agentsync coordinates whichever project the session is in instead of requiring a pinned repo.",
+      "why": "_cfg already reads AGENTSYNC_REPO from the env per call, so adding `or _xylem_session_project()` is a one-line, low-risk change. The pointer is the same shared file context-keeper and the Xylem hook use, honored only when the explicit env pin is absent, so existing pinned setups are unchanged. Agent id still comes from AGENTSYNC_AGENT_ID.  Problem: agentsync hard-required AGENTSYNC_REPO, so the Xylem installer pinned it to the install-time $PROJECT_DIR and every session coordinated that one frozen repo. Part of Xylem-stack audit fix 1b (make context-keeper and agentsync follow the session like cambium does).",
+      "tags": [
+        "agentsync",
+        "resolution",
+        "xylem",
+        "session",
+        "config",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "agentsync",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-001-27a1"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-05T14:53:15.388024+00:00",
+      "updated_at": "2026-08-05T14:53:15.388024+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "agentsync"
+        ]
+      }
+    },
+    {
+      "id": "k-85a2c224",
+      "type": "memory",
+      "kind": "decision",
+      "content": "claim() refuses when the agent id already holds an in-progress claim written by a different server instance, returning status \"blocked\" with a shared_agent_id reason. force=True still overrides. Claims stay keyed by agent id alone.",
+      "why": "DESIGN framed shared ids as two PEOPLE sharing an id, where a non-fatal warning would route them to the real fix (unique ids). The actual common case is one person running several agents (desktop, phone, remote) - the same collision with no second person to read the warning. Blocking makes the destructive path chosen rather than stumbled into, while force=True preserves DESIGN's \"advisory, not enforced\" principle so a restarted server reclaiming its own slot is one call away. The block message names the task, branch and files that would be lost, and points at the real fix.  Problem: claims.json holds exactly one claim per agent id. A second agent running under the same AGENTSYNC_AGENT_ID overwrote the first agent's claim and got status \"claimed\" back. The duplicate-instance warning was attached to that success result, so it was produced after the claim it warned about was already erased, with nothing left to recover it from. Worse, the overlap loop skips our own id, so the erased claim's files lost their protection silently: a third agent would survey, see nothing holding them, and edit. Four independent agents reported this before it was traced.",
+      "tags": [
+        "agentsync",
+        "claims",
+        "concurrency",
+        "identity",
+        "coordination",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "agentsync",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-002-90ef"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-05T14:53:15.388024+00:00",
+      "updated_at": "2026-08-05T14:53:15.388024+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "agentsync"
+        ]
+      }
+    },
+    {
+      "id": "k-0ddff23d",
+      "type": "memory",
+      "kind": "decision",
+      "content": "survey() now returns my_claim (your own current claim, None when you hold nothing). A guard blocking an unrelated re-claim over your own active claim was written and then REVERTED as contradicting settled decisions; the sanctioned fix for concurrent agents remains a distinct AGENTSYNC_AGENT_ID per session.",
+      "why": "my_claim is additive, cannot change any existing behaviour, and directly enables the rule AGENTS.md already states ('Query, never assume: a fresh survey() beats memory of an earlier one') for your own claim rather than only for partners'. The stronger fix - blocking a zero-overlap re-claim over your own active claim - was implemented, tested, and then deliberately reverted because it contradicts two settled decisions: AGENTS.md:73 makes re-claiming different files without releasing the INTENDED flow (pinned by test_same_instance_reclaim_is_not_a_collision), and dec-002-90ef already considered and rejected per-instance claim keying on orphan-accumulation grounds, naming unique AGENTSYNC_AGENT_IDs as the sanctioned answer for concurrent agents. Overriding either would have been re-litigating a settled decision rather than fixing a bug.  Problem: survey()['partners'] deliberately excludes your own entry, and check_conflicts() returns early with 'No partner branches to check' when you are the only active agent, so nothing in the tool surface could answer 'what am I currently holding?'. That gap bites at release()/finish(): one agent id holds exactly one claim, so a concurrent session under the same id can replace yours, and closing 'your' claim without looking closes whatever now occupies the slot. Observed 2026-07-26: a balatron claim was replaced by an unrelated meristem claim under agent id jonny-desktop, and the release() that followed closed the meristem one (an unrelated project already marked done). dec-002-90ef's shared_id guard did not fire because it triggers on a DIFFERENT instance token, and one MCP server process can serve several concurrent Claude sessions, so both claims carried the same INSTANCE.",
+      "tags": [
+        "agentsync",
+        "coordination",
+        "claims",
+        "survey",
+        "concurrent-sessions",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "agentsync",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-003-a3f9"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-05T14:53:15.388024+00:00",
+      "updated_at": "2026-08-05T14:53:15.388024+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "agentsync"
+        ]
+      }
+    },
+    {
+      "id": "k-5b64f8ea",
+      "type": "memory",
+      "kind": "decision",
+      "content": "Consolidated agentsync client configs onto ONE board with one identity per CLIENT (not per session). Removed the stray repos-root .mcp.json, pinned the Claude Code global entry to the shared board. Per-session agent ids were considered and rejected as unachievable at app scope; collisions are now DETECTED via survey().my_claim rather than prevented.",
+      "why": "One board, one identity per CLIENT, is the coherent model: jonny-desktop (Desktop app), claude-code (Claude Code CLI), jonny-mobile (Cloudflare Worker) are peers on the shared board, so overlap detection works BETWEEN clients instead of them fighting over one slot. aethermoor keeps its own board deliberately - it is a separate mesh with an external collaborator, not an accident. The repos-root .mcp.json was byte-identical to aethermoor's own .mcp.json, so removing it loses nothing while eliminating the misrouting trap. Per-session identities were rejected: the Desktop app spawns MCP servers from an app-level config and shares processes across sessions, so a distinct id per session is not achievable there without per-project duplicate server entries that every session would then see and have to choose between. Detection (survey().my_claim, dec-003-a3f9) is the proportionate answer given the collision is rare.  Problem: The same local Python server (agentsync_server.py) was configured in three places with three identities and TWO different boards: Claude Desktop's claude_desktop_config.json (jonny-desktop -> agentsync-remote board), Claude Code's ~/.claude/settings.json (claude-code -> NO board set, so board resolution fell back unpredictably), and a stray ~/repos/.mcp.json (jarmstrong -> aethermoor board). The repos-root file was the dangerous one: it sits above EVERY project, so any session started at the repos root would claim on the aethermoor board under a different identity, and neither board would show the conflict. Separately, the Desktop config is app-level - one agent id shared by every session in the app, and MCP server processes are shared across sessions - which is how a balatron claim and a meristem claim both landed under jonny-desktop with the same INSTANCE token, defeating dec-002's shared_id guard.",
+      "tags": [
+        "agentsync",
+        "mcp-config",
+        "coordination",
+        "cleanup",
+        "boards",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "agentsync",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-004-c6f5"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-05T14:53:15.388024+00:00",
+      "updated_at": "2026-08-05T14:53:15.388024+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "agentsync"
+        ]
+      }
+    },
+    {
+      "id": "k-2c8bb921",
+      "type": "memory",
+      "kind": "decision",
+      "content": "Migrated to MCP protocol revision 2026-07-28 on mcp>=2.0,<3 (FastMCP to MCPServer), with tools/list and server/discover cache hints. Removing protocol-level sessions does not weaken claim arbitration, because arbitration was never transport state.",
+      "why": "Unlike context-keeper, agentsync has no zero-dependency constraint and already depended on the SDK, so the straightforward FastMCP to MCPServer port was correct. The substantive question was whether losing protocol-level sessions weakens the mutual-exclusion guarantee. It does not: collision safety is compare-and-swap over claims.json using git push as the CAS with push retries, and peer identity is AGENTSYNC_AGENT_ID plus the per-process INSTANCE token. None of that ever read the MCP session, so the removal is inert here. A test now pins that, so a future change cannot quietly make arbitration depend on transport state.  Problem: Revision 2026-07-28 removes the initialize handshake and Mcp-Session-Id, makes server/discover mandatory, and requires resultType plus ttlMs/cacheScope on cacheable results. Separately, SDK v2 deleted mcp.server.fastmcp with no compatibility alias, so the existing unbounded mcp>=1.2 pin was live breakage on any fresh install regardless of the migration.",
+      "tags": [
+        "mcp",
+        "protocol-migration",
+        "2026-07-28",
+        "sdk-v2",
+        "concurrency",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "agentsync",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-005-40f3"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-05T14:53:15.388024+00:00",
+      "updated_at": "2026-08-05T14:53:15.388024+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "agentsync"
+        ]
+      }
+    },
+    {
+      "id": "k-35355610",
+      "type": "memory",
+      "kind": "decision",
+      "content": "Added a Dockerfile so Glama can build and introspect this server. Glama never grades a server it cannot build, which is why agentsync, Conductor and waveform-mcp sat at profile-completion only rather than scoring badly. The three Cloudflare Workers cannot be fixed this way at all.",
+      "why": "Providing the Dockerfile explicitly removes the inference step, which is the only part of the pipeline a maintainer can influence from the repository. Releases themselves are made only through Glama's web admin UI at /admin/dockerfile behind GitHub OAuth, with no API or CLI, so publishing cannot be automated and remains a manual account-holder action. Each image is deliberately minimal, targeting the tools/list introspection that scoring actually needs rather than trying to make every tool functional in a container.  Problem: Six of the ten servers listed on Glama had no grade at all, showing 17-25 percent profile completion. The cause was not poor tool descriptions: Glama runs Tool Definition Quality and Server Coherence scoring off a successful container build and MCP introspection sweep, and per its methodology, maintainers either provide a Dockerfile or Glama infers one, and if inference fails distribution is withheld. No image meant no build, no introspection, and therefore no score.",
+      "tags": [
+        "glama",
+        "mcp",
+        "registry",
+        "docker",
+        "discoverability",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "agentsync",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-006-5058"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-05T14:53:15.388024+00:00",
+      "updated_at": "2026-08-05T14:53:15.388024+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "agentsync"
+        ]
+      }
+    },
+    {
+      "id": "k-37931a69",
+      "type": "memory",
+      "kind": "decision",
+      "content": "The duplicate-id claim guard now keys on the WORK, not the process: claim() refuses when the agent id already holds an in-progress claim for a DIFFERENT task, regardless of `instance`. Re-claiming the same task stays free. release(expect_task=...) added so a concurrent session cannot be closed by mistake.",
+      "why": "The discriminator has to be something that distinguishes 'this agent moving to its next unit' from 'a different concurrent session', and `instance` provably is not it -- it is a property of the process, and the process is shared. The WORK is: a prior in-progress claim for a different task is either a peer session or your own unclosed unit, and both want the same remedy (close it first), and neither should happen by accident. Re-claiming the SAME task stays free because that is how you widen `touches` or fix a branch mid-unit; making that a block would turn the guard into a nuisance that gets force=True'd reflexively, which is how guards die. `instance` is still recorded and still shapes the message -- it distinguishes 'another session sharing this server process' from 'a different instance', which are different remedies -- it just no longer gates the refusal. For the close path, per-session identity genuinely is not available to the server, so the fix is additive and opt-in rather than invented: release(expect_task=...) refuses when the claim in the slot is not the one the caller believes it holds. Callers that omit it behave exactly as before.  Problem: INSTANCE is generated once per SERVER PROCESS (uuid4 at module import) and one agentsync process serves every Claude session on the machine, so concurrent sessions share it. The guard required `prior.instance != INSTANCE` before refusing, which meant it caught a RESTARTED server and waved through a CONCURRENT session -- the case that actually loses work. Observed live on 2026-08-05: a session claimed straight over another session's in-progress meristem claim, same instance e8544d39, status 'claimed', no warning; because the overlap loop skips your own id, the overwritten claim's files silently lost their protection. The same session then lost its own claim to a concurrent release, with survey() reporting my_claim: null and nothing explaining it. A board whose claims silently vanish is worse than no board, because agents rely on it.",
+      "tags": [
+        "agentsync",
+        "claims",
+        "concurrency",
+        "coordination",
+        "silent-failure",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "agentsync",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-007-635e"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-05T14:53:15.388024+00:00",
+      "updated_at": "2026-08-05T14:53:15.388024+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "agentsync"
+        ]
+      }
+    }
+  ],
+  "imported": {
+    "context_keeper": [
+      "dec-001-27a1",
+      "dec-002-90ef",
+      "dec-003-a3f9",
+      "dec-004-c6f5",
+      "dec-005-40f3",
+      "dec-006-5058",
+      "dec-007-635e"
+    ],
+    "agentsync": [],
+    "agentsync_last": {},
+    "import": []
+  }
+}

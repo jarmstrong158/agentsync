@@ -139,9 +139,15 @@ def test_two_person_full_lifecycle():
         be(clones, "jonny")
         assert json.loads(M.update_status("done", note="QoL merged"))["status"] == "updated"
 
-        # 6. partner sees jonny is done, and a follow-up that *depends on* a file
-        #    jonny just finished is NOT blocked (a done claim is not WIP).
+        # 6. partner closes its own unit before starting the next one. One id
+        #    holds one claim, so moving to new work without closing the old one
+        #    would erase it -- refused since the concurrent-session fix.
         be(clones, "partner")
+        assert json.loads(
+            M.update_status("done", note="Systems pass shipped"))["status"] == "updated"
+
+        # 7. partner sees jonny is done, and a follow-up that *depends on* a file
+        #    jonny just finished is NOT blocked (a done claim is not WIP).
         partners = json.loads(M.survey())["partners"]
         assert partners["jonny"]["status"] == "done", partners
         r = json.loads(M.claim("Wire HUD to new UI", ["public/js/hud.js"],

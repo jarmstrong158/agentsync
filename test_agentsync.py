@@ -774,15 +774,92 @@ def test_duplicate_agent_id_ignores_finished_claim():
         assert "warning" not in r, r
 
 
-def test_same_instance_reclaim_is_not_a_collision():
-    """'One unit of work = one claim. Re-claim for the next unit.' (AGENTS.md)"""
+def test_same_process_reclaim_of_different_work_is_blocked():
+    """The case the old guard was blind to, and the one that loses work.
+
+    INSTANCE is generated once per SERVER PROCESS and one agentsync process
+    serves every session on the machine, so two concurrent sessions share it.
+    The guard used to require `instance != INSTANCE`, which caught a RESTARTED
+    server and waved through a CONCURRENT session -- the clobber that actually
+    happens. Observed live on 2026-08-05: a session claimed straight over
+    another session's in-progress claim, same instance, status "claimed", no
+    warning, and the overwritten claim's files silently lost their protection.
+
+    The discriminator is the WORK, not the process.
+    """
     with lab() as (root, origin, clones):
         be(clones, "jonny")
         first = json.loads(M.claim("unit one", ["a.py"], branch="jonny/a"))
         assert first["status"] == "claimed", first
         second = json.loads(M.claim("unit two", ["b.py"], branch="jonny/a"))
+        assert second["status"] == "blocked", second
+        assert second["conflicts"]["jonny"]["their_task"] == "unit one", second
+        # names what would have been lost, and the remedy
+        assert second["conflicts"]["jonny"]["reasons"][0]["files"] == ["a.py"], second
+        assert "sharing this server process" in second["message"], second
+        assert "update_status" in second["message"], second
+        # the first claim is untouched
+        assert json.loads(M.survey())["my_claim"]["task"] == "unit one"
+
+
+def test_same_task_reclaim_still_refines_in_place():
+    """Re-claiming the SAME unit is how you widen `touches` mid-flight. That
+    replaces nothing and must stay free, or the guard becomes a nuisance that
+    gets force=True'd reflexively."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("unit one", ["a.py"], branch="jonny/a")
+        again = json.loads(M.claim("unit one", ["a.py", "b.py"], branch="jonny/a"))
+        assert again["status"] == "claimed", again
+        assert again["claim"]["touches"] == ["a.py", "b.py"], again
+        assert "warning" not in again, again
+
+
+def test_closing_the_unit_frees_the_slot_for_the_next():
+    """'One unit of work = one claim. Re-claim for the next unit.' (AGENTS.md)
+    still holds -- you just have to close the previous unit, which the Xylem
+    discipline requires anyway ('release each claim with a closing note')."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("unit one", ["a.py"], branch="jonny/a")
+        M.update_status("done", note="unit one shipped")
+        second = json.loads(M.claim("unit two", ["b.py"], branch="jonny/a"))
         assert second["status"] == "claimed", second
         assert "warning" not in second, second
+
+
+def test_release_can_refuse_to_close_someone_elses_claim():
+    """A concurrent session under the same id can take the slot between your
+    claim() and your release(); a blind release then closes THEIR work while
+    reporting success. Happened in the same 2026-08-05 session that motivated
+    the guard above -- an in-progress claim vanished with survey() reporting
+    my_claim: null."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("my unit", ["a.py"], branch="jonny/a")
+        # a concurrent session under the same id takes the slot
+        M.claim("their unit", ["b.py"], branch="jonny/b", force=True)
+
+        blocked = json.loads(M.release(expect_task="my unit"))
+        assert blocked["status"] == "blocked", blocked
+        assert blocked["found"]["task"] == "their unit", blocked
+        assert "AGENTSYNC_AGENT_ID" in blocked["message"], blocked
+        # their claim survived
+        assert json.loads(M.survey())["my_claim"]["task"] == "their unit"
+
+        # and releasing what you actually hold still works
+        ok = json.loads(M.release(expect_task="their unit"))
+        assert ok["status"] == "released", ok
+
+
+def test_release_without_expect_task_is_unchanged():
+    """Additive: existing callers that pass no guard keep working."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.claim("some unit", ["a.py"], branch="jonny/a")
+        r = json.loads(M.release())
+        assert r["status"] == "released", r
+        assert r["released"]["task"] == "some unit", r
 
 
 # --------------------------------------------------------------------------- #
@@ -1150,7 +1227,11 @@ TESTS = [
     test_duplicate_agent_id_blocks_instead_of_clobbering,
     test_duplicate_agent_id_force_still_wins,
     test_duplicate_agent_id_ignores_finished_claim,
-    test_same_instance_reclaim_is_not_a_collision,
+    test_same_process_reclaim_of_different_work_is_blocked,
+    test_same_task_reclaim_still_refines_in_place,
+    test_closing_the_unit_frees_the_slot_for_the_next,
+    test_release_can_refuse_to_close_someone_elses_claim,
+    test_release_without_expect_task_is_unchanged,
     test_add_multiple_collaborators,
     test_provision_invites_multiple_partners,
     test_history_timeline,
